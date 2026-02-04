@@ -13,6 +13,10 @@
 #include <algorithm>
 #include <omp.h>
 #include <thread>
+#include <cmath>
+const unsigned int numThreads = std::thread::hardware_concurrency();
+
+// #define numThreads 11
 
 #ifndef NOCDUA
 #include "cuda_testkernel.h"
@@ -20,20 +24,20 @@
 
 #include <stdlib.h>
 
-void Ped::Model::setup(std::vector<Ped::Tagent*> agentsInScenario, std::vector<Twaypoint*> destinationsInScenario, IMPLEMENTATION implementation)
+void Ped::Model::setup(std::vector<Ped::Tagent *> agentsInScenario, std::vector<Twaypoint *> destinationsInScenario, IMPLEMENTATION implementation)
 {
 #ifndef NOCUDA
 	// Convenience test: does CUDA work on this machine?
 	cuda_test();
 #else
-    std::cout << "Not compiled for CUDA" << std::endl;
+	std::cout << "Not compiled for CUDA" << std::endl;
 #endif
 
-	// Set 
-	agents = std::vector<Ped::Tagent*>(agentsInScenario.begin(), agentsInScenario.end());
+	// Set
+	agents = std::vector<Ped::Tagent *>(agentsInScenario.begin(), agentsInScenario.end());
 
 	// Set up destinations
-	destinations = std::vector<Ped::Twaypoint*>(destinationsInScenario.begin(), destinationsInScenario.end());
+	destinations = std::vector<Ped::Twaypoint *>(destinationsInScenario.begin(), destinationsInScenario.end());
 
 	// Sets the chosen implemenation. Standard in the given code is SEQ
 	this->implementation = implementation;
@@ -42,9 +46,82 @@ void Ped::Model::setup(std::vector<Ped::Tagent*> agentsInScenario, std::vector<T
 	setupHeatmapSeq();
 }
 
+void work(const std::vector<Ped::Tagent *> &agents, size_t start, size_t end)
+{
+	for (size_t i = start; i < end; ++i)
+	{
+		agents[i]->computeNextDesiredPosition();
+		agents[i]->setX(agents[i]->getDesiredX());
+		agents[i]->setY(agents[i]->getDesiredY());
+	}
+}
+
 void Ped::Model::tick()
 {
 	// EDIT HERE FOR ASSIGNMENT 1
+	// enum IMPLEMENTATION { CUDA, VECTOR, OMP, PTHREAD, SEQ };
+
+	switch (implementation)
+	{
+	case Ped::OMP:
+	{
+		size_t numAgents = agents.size();
+
+#pragma omp parallel for
+		for (size_t i = 0; i < numAgents; ++i)
+		{
+			agents[i]->computeNextDesiredPosition();
+			agents[i]->setX(agents[i]->getDesiredX());
+			agents[i]->setY(agents[i]->getDesiredY());
+		}
+		break;
+	}
+	case Ped::SEQ:
+	{
+		size_t numAgents = agents.size();
+
+		for (size_t i = 0; i < numAgents; ++i)
+		{
+			agents[i]->computeNextDesiredPosition();
+			agents[i]->setX(agents[i]->getDesiredX());
+			agents[i]->setY(agents[i]->getDesiredY());
+		}
+		break;
+	}
+	case Ped::PTHREAD:
+	{
+
+		const char *env_t = std::getenv("PTHREAD_NUM_THREADS");
+		int numThreads = (env_t != NULL) ? std::stoi(env_t) : 1;
+
+		if (numThreads < 1) numThreads = 1;
+
+		int numAgents = agents.size();
+		int chunksize = (numAgents + numThreads - 1) / numThreads;
+		std::thread *workers = new std::thread[numThreads];
+
+		for (size_t i = 0; i < numThreads; i++)
+		{
+			int start = i * chunksize;
+			int end = std::min(start + chunksize, numAgents);
+
+			if (start < end)
+			{
+				workers[i] = std::thread(work, std::ref(agents), start, end);
+			}
+		}
+		for (int i = 0; i < numThreads; i++)
+		{
+			if (workers[i].joinable())
+			{
+				workers[i].join();
+			}
+		}
+		delete[] workers;
+	}
+	default:
+		break;
+	}
 }
 
 ////////////
@@ -60,15 +137,16 @@ void Ped::Model::move(Ped::Tagent *agent)
 	set<const Ped::Tagent *> neighbors = getNeighbors(agent->getX(), agent->getY(), 2);
 
 	// Retrieve their positions
-	std::vector<std::pair<int, int> > takenPositions;
-	for (std::set<const Ped::Tagent*>::iterator neighborIt = neighbors.begin(); neighborIt != neighbors.end(); ++neighborIt) {
+	std::vector<std::pair<int, int>> takenPositions;
+	for (std::set<const Ped::Tagent *>::iterator neighborIt = neighbors.begin(); neighborIt != neighbors.end(); ++neighborIt)
+	{
 		std::pair<int, int> position((*neighborIt)->getX(), (*neighborIt)->getY());
 		takenPositions.push_back(position);
 	}
 
 	// Compute the three alternative positions that would bring the agent
 	// closer to his desiredPosition, starting with the desiredPosition itself
-	std::vector<std::pair<int, int> > prioritizedAlternatives;
+	std::vector<std::pair<int, int>> prioritizedAlternatives;
 	std::pair<int, int> pDesired(agent->getDesiredX(), agent->getDesiredY());
 	prioritizedAlternatives.push_back(pDesired);
 
@@ -81,7 +159,8 @@ void Ped::Model::move(Ped::Tagent *agent)
 		p1 = std::make_pair(pDesired.first + diffY, pDesired.second + diffX);
 		p2 = std::make_pair(pDesired.first - diffY, pDesired.second - diffX);
 	}
-	else {
+	else
+	{
 		// Agent wants to walk diagonally
 		p1 = std::make_pair(pDesired.first, agent->getY());
 		p2 = std::make_pair(agent->getX(), pDesired.second);
@@ -90,12 +169,14 @@ void Ped::Model::move(Ped::Tagent *agent)
 	prioritizedAlternatives.push_back(p2);
 
 	// Find the first empty alternative position
-	for (std::vector<pair<int, int> >::iterator it = prioritizedAlternatives.begin(); it != prioritizedAlternatives.end(); ++it) {
+	for (std::vector<pair<int, int>>::iterator it = prioritizedAlternatives.begin(); it != prioritizedAlternatives.end(); ++it)
+	{
 
 		// If the current position is not yet taken by any neighbor
-		if (std::find(takenPositions.begin(), takenPositions.end(), *it) == takenPositions.end()) {
+		if (std::find(takenPositions.begin(), takenPositions.end(), *it) == takenPositions.end())
+		{
 
-			// Set the agent's position 
+			// Set the agent's position
 			agent->setX((*it).first);
 			agent->setY((*it).second);
 
@@ -111,19 +192,23 @@ void Ped::Model::move(Ped::Tagent *agent)
 /// \param   x the x coordinate
 /// \param   y the y coordinate
 /// \param   dist the distance around x/y that will be searched for agents (search field is a square in the current implementation)
-set<const Ped::Tagent*> Ped::Model::getNeighbors(int x, int y, int dist) const {
+set<const Ped::Tagent *> Ped::Model::getNeighbors(int x, int y, int dist) const
+{
 
 	// create the output list
-	// ( It would be better to include only the agents close by, but this programmer is lazy.)	
-	return set<const Ped::Tagent*>(agents.begin(), agents.end());
+	// ( It would be better to include only the agents close by, but this programmer is lazy.)
+	return set<const Ped::Tagent *>(agents.begin(), agents.end());
 }
 
-void Ped::Model::cleanup() {
-	// Nothing to do here right now. 
+void Ped::Model::cleanup()
+{
+	// Nothing to do here right now.
 }
 
 Ped::Model::~Model()
 {
-	std::for_each(agents.begin(), agents.end(), [](Ped::Tagent *agent){delete agent;});
-	std::for_each(destinations.begin(), destinations.end(), [](Ped::Twaypoint *destination){delete destination; });
+	std::for_each(agents.begin(), agents.end(), [](Ped::Tagent *agent)
+				  { delete agent; });
+	std::for_each(destinations.begin(), destinations.end(), [](Ped::Twaypoint *destination)
+				  { delete destination; });
 }
