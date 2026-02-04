@@ -8,8 +8,8 @@ LIBPEDCUDASOURCES=$(shell echo ../libpedsim/*.cu)
 LIBPEDCUDAOBJECTS=$(LIBPEDSOURCES:.cu=.co)
 
 TARGET=demo
-QT_HEADERS=$(shell qmake -query QT_INSTALL_HEADERS)
-QTINCLUDES=-I$(QT_HEADERS) -I$(QT_HEADERS)/QtWidgets -I$(QT_HEADERS)/QtGui -I$(QT_HEADERS)/QtCore
+QT_HEADERS = /usr/include/x86_64-linux-gnu/qt5
+QTINCLUDES = -I$(QT_HEADERS) -I$(QT_HEADERS)/QtWidgets -I$(QT_HEADERS)/QtGui -I$(QT_HEADERS)/QtCore -I/usr/include/qt5 -I/usr/include/qt5/QtWidgets
 INCPATH=-I../libpedsim
 LIBPATH=-L../libpedsim
 CXXFLAGS=-g -fPIC $(INCPATH) $(QTINCLUDES) $(LIBPATH) -fopenmp
