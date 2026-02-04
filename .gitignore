@@ -40,3 +40,8 @@
 
 # binary file
 demo/demo
+
+# Config files
+/demo/config.mk
+/demo/Makefile
+/libpedsim/Makefile
