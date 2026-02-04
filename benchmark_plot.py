@@ -4,7 +4,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 
-SCENARIO = "hugeScenario.xml"
+SCENARIO = "scenario_box.xml"
 EXECUTABLE = "./demo/demo"
 MAX_THREADS = 16
 RUNS = 1
