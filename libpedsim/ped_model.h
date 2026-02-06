@@ -38,7 +38,7 @@ namespace Ped{
 		float *destY;
 		float *destR;
 		int numAgents;
-		
+		int paddedSize;
 
 
 		// Coordinates a time step in the scenario: move all agents by one step (if applicable).

@@ -4,14 +4,14 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 
-SCENARIO = "scenario_box.xml"
+# Configuration
+SCENARIOS = ["hugeScenario.xml", "scenario_box.xml", "scenario.xml"]
 EXECUTABLE = "./demo/demo"
 MAX_THREADS = 16
-RUNS = 1
+RUNS = 15
 
-def run_and_get_time(flag, threads):
+def run_and_get_time(flag, threads, current_scenario):
     env = os.environ.copy()
-    # Ensure BOTH parallel frameworks get the thread count
     env["OMP_NUM_THREADS"] = str(threads)
     env["PTHREAD_NUM_THREADS"] = str(threads)
 
@@ -19,7 +19,7 @@ def run_and_get_time(flag, threads):
     valid = 0
     for _ in range(RUNS):
         result = subprocess.run(
-            [EXECUTABLE, "--timing-mode", flag, SCENARIO],
+            [EXECUTABLE, "--timing-mode", flag, current_scenario],
             capture_output=True, text=True, env=env
         )
         match = re.search(r"Target time:\s*([0-9.]+)\s*milliseconds", result.stdout)
@@ -28,61 +28,73 @@ def run_and_get_time(flag, threads):
             valid += 1
     return total / valid if valid > 0 else None
 
-# ---- Run SEQ baseline ----
-print("Running SEQ baseline...")
-T_seq = run_and_get_time("--seq", 1)
-if T_seq is None: 
-    raise RuntimeError("Failed to get SEQ baseline. Is your program compiled?")
-print(f"SEQ Time: {T_seq:.2f} ms\n")
+# ---- Main Loop for Scenarios ----
+for scenario_file in SCENARIOS:
+    scenario_name = scenario_file.replace(".xml", "")
+    print(f"\n{'='*40}")
+    print(f"STARTING BENCHMARK: {scenario_file}")
+    print(f"{'='*40}")
 
-thread_counts = list(range(1, MAX_THREADS + 1))
-results = {"SEQ": [1.0]*MAX_THREADS, "OMP": [], "PTHREAD": []}
+    # Reset results for this specific scenario
+    results = {"SEQ": [1.0]*MAX_THREADS, "OMP": [], "PTHREAD": [], "SIMD": []}
+    thread_counts = list(range(1, MAX_THREADS + 1))
 
-# ---- Benchmarking Loop with Detailed Output ----
-for impl, flag in [("OMP", "--omp"), ("PTHREAD", "--pthread")]:
-    print(f"Benchmarking {impl}:")
-    for t in thread_counts:
-        print(f"  Threads: {t}") # This shows you the progress
-        T = run_and_get_time(flag, t)
-        results[impl].append(T_seq / T if T else None)
-    print(f"Finished {impl}.\n")
+    # 1. Run SEQ baseline for THIS scenario
+    print(f"Running SEQ baseline for {scenario_name}...")
+    T_seq = run_and_get_time("--seq", 1, scenario_file)
+    if T_seq is None: 
+        print(f"❌ Error: Could not run SEQ for {scenario_file}. Skipping.")
+        continue
+    print(f"SEQ Base Time: {T_seq:.2f} ms")
 
-# ---- Amdahl Math ----
-valid_omp = [(t, s) for t, s in zip(thread_counts, results["OMP"]) if s is not None and t > 1]
-if valid_omp:
-    # Estimate 'p' (clamped for realistic curve)
-    realistic_points = [(t, s) for t, s in valid_omp if s <= t]
-    if realistic_points:
-        best_t, best_s = max(realistic_points, key=lambda x: x[1])
-    else:
+    # 2. Benchmarking Loop
+    for impl, flag in [("OMP", "--omp"), ("PTHREAD", "--pthread"), ("SIMD", "--simd")]:
+        print(f"Benchmarking {impl}...")
+        for t in thread_counts:
+            print(f"  Threads: {t}", end="\r")
+            T = run_and_get_time(flag, t, scenario_file)
+            results[impl].append(T_seq / T if T else 0)
+        print(f"\nFinished {impl}.")
+
+    # 3. Amdahl Math (Based on OMP)
+    valid_omp = [(t, s) for t, s in zip(thread_counts, results["OMP"]) if s > 0 and t > 1]
+    if valid_omp:
         best_t, best_s = max(valid_omp, key=lambda x: x[1])
+        p_est = (1 - 1 / best_s) / (1 - 1 / (best_t if best_t > 1 else 2))
+        p = max(0.0, min(0.99, p_est)) 
+    else:
+        p = 0.0 
+
+    N = np.array(thread_counts)
+    amdahl = 1 / ((1 - p) + p / N)
+
+    # 4. Plotting
+    plt.figure(figsize=(12, 8), dpi=150)
+    plt.plot(thread_counts, results["SEQ"], marker="o", label="SEQ (Scalar Base)")
+    plt.plot(thread_counts, results["OMP"], marker="o", label="OMP (Scalar Parallel)")
+    plt.plot(thread_counts, results["PTHREAD"], marker="o", label="PTHREAD (Scalar Parallel)")
+    plt.plot(thread_counts, results["SIMD"], marker="s", label="SIMD + OMP (Vector Parallel)", color="purple")
+    plt.plot(thread_counts, amdahl, "--", label=f"Amdahl OMP (p={p:.2f})", color='tab:red')
+
+    plt.xlabel("Number of Threads")
+    plt.ylabel("Speedup (relative to SEQ)")
+    plt.title(f"Speedup Comparison: {scenario_file}\n(Baseline SEQ: {T_seq:.2f}ms)")
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.5)
+    plt.xticks(thread_counts)
+
+    # Adjust limits dynamically
+    max_val = max([max(results[k]) for k in results if results[k]])
+    plt.ylim(0, max_val * 1.2)
+    plt.xlim(1, MAX_THREADS)
+
+    # Save with required naming convention
+    save_name = f"ass2_{scenario_name}.png"
+    plt.savefig(save_name, bbox_inches="tight")
+    plt.close() # Important: Close plot to free memory for next scenario
     
-    p_est = (1 - 1 / best_s) / (1 - 1 / best_t)
-    p = max(0.0, min(0.95, p_est)) 
-else:
-    p = 0.85 
+    print(f"✅ Success! Plot saved as: {save_name}")
 
-N = np.array(thread_counts)
-amdahl = 1 / ((1 - p) + p / N)
-
-# ---- Plotting ----
-plt.figure(figsize=(10, 7), dpi=150)
-plt.plot(thread_counts, results["SEQ"], marker="o", label="SEQ")
-plt.plot(thread_counts, results["OMP"], marker="o", label="OMP")
-plt.plot(thread_counts, results["PTHREAD"], marker="o", label="PTHREAD")
-plt.plot(thread_counts, amdahl, "--", label=f"Amdahl (p={p:.2f})", color='tab:red')
-
-plt.xlabel("Number of Threads")
-plt.ylabel("Speedup")
-plt.title("Speedup vs Number of Threads")
-plt.legend()
-plt.grid(True)
-plt.xticks(thread_counts)
-
-# Constraints for the graph
-plt.xlim(1, MAX_THREADS)  # Start at thread 1
-plt.ylim(0, 10)  # Cap at 10 for visibility
-
-plt.savefig("speedup_plot.png", bbox_inches="tight")
-print(f"\n✅ Parallel fraction p ≈ {p:.2f}")
-print("✅ Speedup plot saved as speedup_plot.png")
+print(f"\n{'='*40}")
+print("ALL BENCHMARKS COMPLETE")
+print(f"{'='*40}")
