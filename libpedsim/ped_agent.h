@@ -40,13 +40,15 @@ namespace Ped {
 		// Update the position according to get closer
 		// to the current destination
 		void computeNextDesiredPosition();
-
 		// Position of agent defined by x and y
 		int getX() const { return x; };
 		int getY() const { return y; };
 
 		// Adds a new waypoint to reach for this agent
 		void addWaypoint(Twaypoint* wp);
+		
+		// Returns the next destination to visit
+		Twaypoint* getNextDestination();
 
 	private:
 		Tagent() {};
@@ -71,8 +73,6 @@ namespace Ped {
 		// Internal init function 
 		void init(int posX, int posY);
 
-		// Returns the next destination to visit
-		Twaypoint* getNextDestination();
 	};
 }
 

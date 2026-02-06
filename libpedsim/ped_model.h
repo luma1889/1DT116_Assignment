@@ -30,7 +30,17 @@ namespace Ped{
 
 		// Sets everything up
 		void setup(std::vector<Tagent*> agentsInScenario, std::vector<Twaypoint*> destinationsInScenario,IMPLEMENTATION implementation);
+
+
+		float *agentX;
+		float *agentY;
+		float *destX;
+		float *destY;
+		float *destR;
+		int numAgents;
 		
+
+
 		// Coordinates a time step in the scenario: move all agents by one step (if applicable).
 		void tick();
 

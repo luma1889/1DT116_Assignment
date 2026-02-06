@@ -14,6 +14,7 @@
 #include <omp.h>
 #include <thread>
 #include <cmath>
+#include <immintrin.h> 
 const unsigned int numThreads = std::thread::hardware_concurrency();
 
 // #define numThreads 11
@@ -38,6 +39,29 @@ void Ped::Model::setup(std::vector<Ped::Tagent *> agentsInScenario, std::vector<
 
 	// Set up destinations
 	destinations = std::vector<Ped::Twaypoint *>(destinationsInScenario.begin(), destinationsInScenario.end());
+
+	numAgents = agents.size();
+	agentX = (float*)_mm_malloc(numAgents * sizeof(float), 32); // TODO: Check if use this: sizeof(__mm256)
+	agentY = (float*)_mm_malloc(numAgents * sizeof(float), 32);
+	destX  = (float*)_mm_malloc(numAgents * sizeof(float), 32);
+	destY  = (float*)_mm_malloc(numAgents * sizeof(float), 32);
+	destR  = (float*)_mm_malloc(numAgents * sizeof(float), 32);
+	
+	for (size_t i = 0; i < numAgents; ++i)
+	{
+		agentX[i] = agents[i]->getX();
+		agentY[i] = agents[i]->getY();
+
+		Twaypoint* wp = agents[i]->getNextDestination();
+		if (wp)
+		{
+			destX[i] = wp->getx();
+			destY[i] = wp->gety();
+			destR[i] = wp->getr();
+		}
+		
+
+	}
 
 	// Sets the chosen implemenation. Standard in the given code is SEQ
 	this->implementation = implementation;
@@ -119,6 +143,121 @@ void Ped::Model::tick()
 		}
 		delete[] workers;
 	}
+	case Ped::VECTOR:
+	{
+		#pragma omp parallel for schedule(static, 8)
+		for (int i = 0; i <= numAgents - 8; i += 8)
+		{
+			bool reachedDest = false;
+			__m256 aX = _mm256_load_ps(&agentX[i]);
+			__m256 aY = _mm256_load_ps(&agentY[i]);
+			__m256 dX = _mm256_load_ps(&destX[i]);
+			__m256 dY = _mm256_load_ps(&destY[i]);
+			__m256 dR = _mm256_load_ps(&destR[i]);
+
+			__m256 diffX = _mm256_sub_ps(dX, aX);
+			__m256 diffY = _mm256_sub_ps(dY, aY);
+
+			// __m256 sq_len = _mm256_add_ps(_mm256_mul_ps(diffX, diffX), _mm256_mul_ps(diffY, diffY));
+			__m256 sq_len = _mm256_fmadd_ps(diffX, diffX, _mm256_mul_ps(diffY, diffY));
+			// __m256 len = _mm256_sqrt_ps(sq_len);
+
+			// __m256 nextX = _mm256_add_ps(aX, _mm256_div_ps(diffX, len));
+			// __m256 nextY = _mm256_add_ps(aY, _mm256_div_ps(diffY, len));
+			__m256 invLen = _mm256_rsqrt_ps(sq_len);
+
+			__m256 nextX = _mm256_fmadd_ps(diffX, invLen, aX);
+			__m256 nextY = _mm256_fmadd_ps(diffY, invLen, aY);
+
+			__m256 roundedX = _mm256_round_ps(nextX, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+			__m256 roundedY = _mm256_round_ps(nextY, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+
+			_mm256_store_ps (&agentX[i], roundedX);
+			_mm256_store_ps (&agentY[i], roundedY);
+
+			for (int j = 0; j < 8; j++)
+			{
+				agents[i+j]->setX((int)agentX[i+j]);
+				agents[i+j]->setY((int)agentY[i+j]);
+			}
+			
+
+			// Optimized so we only go into scalar if we have reached destination
+			__m256 len = _mm256_sqrt_ps(sq_len);
+			__m256 mask = _mm256_cmp_ps(len, dR, _CMP_LT_OQ);	// _CMP_LT_OQ = "Less Than, Ordered, Quiet"
+
+			int bitmask = _mm256_movemask_ps(mask);
+
+			if (bitmask != 0) {
+				for (int j = 0; j < 8; ++j) {
+					if ((bitmask >> j) & 1) {
+						Twaypoint* next = agents[i+j]->getNextDestination();
+						if (next) {
+							destX[i+j] = (float)next->getx();
+							destY[i+j] = (float)next->gety();
+							destR[i+j] = (float)next->getr();
+						}
+					}
+				}
+			}
+		}
+
+		// Unoptimized, goes to scalar everythime even though destination is not reached
+
+		// float dists[8];
+        // _mm256_storeu_ps(dists, len);
+        
+        // for (int j = 0; j < 8; ++j) {
+        //     // Update the actual object position for GUI
+        //     agents[i+j]->setX((int)agentX[i+j]);
+        //     agents[i+j]->setY((int)agentY[i+j]);
+
+        //     // If reached destination, get next one and update SoA arrays
+        //     if (dists[j] < destR[i+j]) {
+        //         Twaypoint* next = agents[i+j]->getNextDestination();
+        //         if (next) {
+        //             destX[i+j] = (float)next->getx();
+        //             destY[i+j] = (float)next->gety();
+        //             destR[i+j] = (float)next->getr();
+        //         }
+        //     }
+		
+		// For (numAgents % 8)
+		int remainder_start = (numAgents / 8) * 8;
+		for (int i = remainder_start; i < numAgents; ++i)
+		{
+
+			float dx = destX[i] - agentX[i];
+			float dy = destY[i] - agentY[i];
+			float len = sqrt(dx*dx + dy*dy);
+			
+			float newX = (int)round(agentX[i] + dx / len);
+			float newY = (int)round(agentY[i] + dy / len);
+
+			agents[i]->setX(newX);
+    		agents[i]->setY(newY);
+
+			// agents[i]->computeNextDesiredPosition();
+			// agents[i]->setX(agents[i]->getDesiredX());
+			// agents[i]->setY(agents[i]->getDesiredY());
+
+			agentX[i] = (float)newX;
+        	agentY[i] = (float)newY;
+
+
+			if (len < destR[i]) {
+				Twaypoint* next = agents[i]->getNextDestination();
+				if (next) {
+					destX[i] = (float)next->getx();
+					destY[i] = (float)next->gety();
+					destR[i] = (float)next->getr();
+				}
+			}
+
+		}
+		break;
+	}
+	
 	default:
 		break;
 	}
@@ -203,10 +342,17 @@ set<const Ped::Tagent *> Ped::Model::getNeighbors(int x, int y, int dist) const
 void Ped::Model::cleanup()
 {
 	// Nothing to do here right now.
+	if (agentX) _mm_free(agentX);
+    if (agentY) _mm_free(agentY);
+    if (destX)  _mm_free(destX);
+    if (destY)  _mm_free(destY);
+    if (destR)  _mm_free(destR);
 }
 
 Ped::Model::~Model()
 {
+	cleanup();
+
 	std::for_each(agents.begin(), agents.end(), [](Ped::Tagent *agent)
 				  { delete agent; });
 	std::for_each(destinations.begin(), destinations.end(), [](Ped::Twaypoint *destination)
