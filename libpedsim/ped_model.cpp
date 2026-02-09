@@ -271,31 +271,32 @@ void Ped::Model::tick()
 			__m256 dR = _mm256_load_ps(&destR[i]);
 			__m256 mask = _mm256_cmp_ps(len, dR, _CMP_LT_OQ);	// _CMP_LT_OQ = "Less Than, Ordered, Quiet"
 
-			__m256 nextDX = _mm256_load_ps(&destX[i]);
-        	__m256 nextDY = _mm256_load_ps(&destY[i]);
-        	__m256 nextDR = _mm256_load_ps(&destR[i]);
 
-     		__m256 blendedDX = _mm256_blendv_ps(dX, nextDX, mask);
-        	__m256 blendedDY = _mm256_blendv_ps(dY, nextDY, mask);
-        	__m256 blendedDR = _mm256_blendv_ps(dR, nextDR, mask);
+			// __m256 nextDX = _mm256_load_ps(&destX[i]);
+        	// __m256 nextDY = _mm256_load_ps(&destY[i]);
+        	// __m256 nextDR = _mm256_load_ps(&destR[i]);
 
-     		_mm256_store_ps(&destX[i], blendedDX);
-        	_mm256_store_ps(&destY[i], blendedDY);
-        	_mm256_store_ps(&destR[i], blendedDR);
-			// int bitmask = _mm256_movemask_ps(mask);
+     		// __m256 blendedDX = _mm256_blendv_ps(dX, nextDX, mask);
+        	// __m256 blendedDY = _mm256_blendv_ps(dY, nextDY, mask);
+        	// __m256 blendedDR = _mm256_blendv_ps(dR, nextDR, mask);
 
-			// if (bitmask != 0) {
-			// 	for (int j = 0; j < 8; ++j) {
-			// 		if ((bitmask >> j) & 1) {
-			// 			Twaypoint* next = agents[i+j]->getNextDestination();
-			// 			if (next) {
-			// 				destX[i+j] = (float)next->getx();
-			// 				destY[i+j] = (float)next->gety();
-			// 				destR[i+j] = (float)next->getr();
-			// 			}
-			// 		}
-			// 	}
-			// }
+     		// _mm256_store_ps(&destX[i], blendedDX);
+        	// _mm256_store_ps(&destY[i], blendedDY);
+        	// _mm256_store_ps(&destR[i], blendedDR);
+			int bitmask = _mm256_movemask_ps(mask);
+
+			if (bitmask != 0) {
+				for (int j = 0; j < 8; ++j) {
+					if ((bitmask >> j) & 1) {
+						Twaypoint* next = agents[i+j]->getNextDestination();
+						if (next) {
+							destX[i+j] = (float)next->getx();
+							destY[i+j] = (float)next->gety();
+							destR[i+j] = (float)next->getr();
+						}
+					}
+				}
+			}
 		}
 
 		// Unoptimized, goes to scalar everythime even though destination is not reached
