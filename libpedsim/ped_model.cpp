@@ -499,6 +499,8 @@ void Ped::Model::cleanup()
     if (d_destX)  cudaFree(d_destX);
     if (d_destY)  cudaFree(d_destY);
 	if (d_destR)  cudaFree(d_destR);
+	if (d_reached) cudaFree(d_reached);
+	if (h_reached) cudaFree(h_reached);
 
 }
 

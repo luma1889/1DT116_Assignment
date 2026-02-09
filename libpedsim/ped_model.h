@@ -41,7 +41,7 @@ namespace Ped{
 		int numAgents;
 		int paddedSize;
 		int8_t *d_reached;  // Make sure this is int8_t to match your kernel
-		int8_t *h_reached
+		int8_t *h_reached;
 
 		float *d_agentX;
 		float *d_agentY;
