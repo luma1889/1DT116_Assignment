@@ -53,12 +53,14 @@ void Ped::Model::setup(std::vector<Ped::Tagent *> agentsInScenario, std::vector<
 	destR  = (float*)_mm_malloc(alloc_size, 32);
 	agents = agentsInScenario;
 
-	cudaMalloc(&d_agentX, alloc_size);
-    cudaMalloc(&d_agentY, alloc_size);
-    cudaMalloc(&d_destX, alloc_size);
-    cudaMalloc(&d_destY, alloc_size);
-	cudaMalloc(&d_destR, alloc_size);
-	
+	cudaMallocHost(&d_agentX, alloc_size);
+    cudaMallocHost(&d_agentY, alloc_size);
+    cudaMallocHost(&d_destX, alloc_size);
+    cudaMallocHost(&d_destY, alloc_size);
+	cudaMallocHost(&d_destR, alloc_size);
+
+	cudaMallocHost(&d_reached, paddedSize * sizeof(int8_t));
+	cudaMallocHost(&h_reached, paddedSize * sizeof(int8_t));
 	for (size_t i = 0; i < paddedSize; ++i)
     {
         if (i < numAgents) {
@@ -271,31 +273,31 @@ void Ped::Model::tick()
 			__m256 dR = _mm256_load_ps(&destR[i]);
 			__m256 mask = _mm256_cmp_ps(len, dR, _CMP_LT_OQ);	// _CMP_LT_OQ = "Less Than, Ordered, Quiet"
 
-			__m256 nextDX = _mm256_load_ps(&destX[i]);
-        	__m256 nextDY = _mm256_load_ps(&destY[i]);
-        	__m256 nextDR = _mm256_load_ps(&destR[i]);
+			// __m256 nextDX = _mm256_load_ps(&destX[i]);
+        	// __m256 nextDY = _mm256_load_ps(&destY[i]);
+        	// __m256 nextDR = _mm256_load_ps(&destR[i]);
 
-     		__m256 blendedDX = _mm256_blendv_ps(dX, nextDX, mask);
-        	__m256 blendedDY = _mm256_blendv_ps(dY, nextDY, mask);
-        	__m256 blendedDR = _mm256_blendv_ps(dR, nextDR, mask);
+     		// __m256 blendedDX = _mm256_blendv_ps(dX, nextDX, mask);
+        	// __m256 blendedDY = _mm256_blendv_ps(dY, nextDY, mask);
+        	// __m256 blendedDR = _mm256_blendv_ps(dR, nextDR, mask);
 
-     		_mm256_store_ps(&destX[i], blendedDX);
-        	_mm256_store_ps(&destY[i], blendedDY);
-        	_mm256_store_ps(&destR[i], blendedDR);
-			// int bitmask = _mm256_movemask_ps(mask);
+     		// _mm256_store_ps(&destX[i], blendedDX);
+        	// _mm256_store_ps(&destY[i], blendedDY);
+        	// _mm256_store_ps(&destR[i], blendedDR);
+			int bitmask = _mm256_movemask_ps(mask);
 
-			// if (bitmask != 0) {
-			// 	for (int j = 0; j < 8; ++j) {
-			// 		if ((bitmask >> j) & 1) {
-			// 			Twaypoint* next = agents[i+j]->getNextDestination();
-			// 			if (next) {
-			// 				destX[i+j] = (float)next->getx();
-			// 				destY[i+j] = (float)next->gety();
-			// 				destR[i+j] = (float)next->getr();
-			// 			}
-			// 		}
-			// 	}
-			// }
+			if (bitmask != 0) {
+				for (int j = 0; j < 8; ++j) {
+					if ((bitmask >> j) & 1) {
+						Twaypoint* next = agents[i+j]->getNextDestination();
+						if (next) {
+							destX[i+j] = (float)next->getx();
+							destY[i+j] = (float)next->gety();
+							destR[i+j] = (float)next->getr();
+						}
+					}
+				}
+			}
 		}
 
 		// Unoptimized, goes to scalar everythime even though destination is not reached
@@ -354,47 +356,48 @@ void Ped::Model::tick()
 		break;
 	}
 	case Ped::CUDA:
-	{
-		// STEP 1: No cudaMemcpy(HostToDevice) for agentX/Y! 
-		// The GPU already has the values from the last tick.
+{
+    size_t pos_size = numAgents * sizeof(float);
 
-		// STEP 2: Compute
-		cudaKernelfunction(d_agentX, d_agentY, d_destX, d_destY, d_destR, d_reached, numAgents);
+    // 1. Launch Kernel
+    cudaKernelfunction(d_agentX, d_agentY, d_destX, d_destY, d_destR, d_reached, numAgents);
 
-		// STEP 3: Only download what we need to show on screen
-		size_t transfer_size = numAgents * sizeof(float);
-		cudaMemcpyAsync(agentX, d_agentX, transfer_size, cudaMemcpyDeviceToHost);
-		cudaMemcpyAsync(agentY, d_agentY, transfer_size, cudaMemcpyDeviceToHost);
-		cudaMemcpyAsync(h_reached, d_reached, numAgents * sizeof(int8_t), cudaMemcpyDeviceToHost);
-		
-		cudaDeviceSynchronize();
+    // 2. Download everything at once (Use the standard Memcpy for now to stay safe)
+    cudaMemcpy(agentX, d_agentX, pos_size, cudaMemcpyDeviceToHost);
+    cudaMemcpy(agentY, d_agentY, pos_size, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_reached, d_reached, numAgents * sizeof(int8_t), cudaMemcpyDeviceToHost);
 
-		// STEP 4: Logic & Destination Batching
-		bool destinationsChanged = false;
-		#pragma omp parallel for reduction(|:destinationsChanged)
-		for (int i = 0; i < numAgents; i++) {
-			if (h_reached[i]) {
-				Twaypoint* next = agents[i]->getNextDestination();
-				if (next) {
-					destX[i] = next->getx(); 
-					destY[i] = next->gety(); 
-					destR[i] = next->getr();
-					destinationsChanged = true;
-				}
-			}
-			// Only do this if your GUI actually needs it every tick
-			agents[i]->setX((int)roundf(agentX[i]));
-			agents[i]->setY((int)roundf(agentY[i]));
-		}
+    bool destChanged = false;
 
-		// STEP 5: Only upload destinations IF they changed
-		if (destinationsChanged) {
-			cudaMemcpy(d_destX, destX, transfer_size, cudaMemcpyHostToDevice);
-			cudaMemcpy(d_destY, destY, transfer_size, cudaMemcpyHostToDevice);
-			cudaMemcpy(d_destR, destR, transfer_size, cudaMemcpyHostToDevice);
-		}
-		break;
-	}
+    // 3. THE SPEED FIX: For 4800 agents, OpenMP overhead is actually SLOW.
+    // Try removing "#pragma omp parallel for" here. 
+    // The cost of waking up threads for 4800 items is higher than just doing it.
+    for (int i = 0; i < numAgents; i++) {
+        // Direct cast is faster than roundf
+        int ix = (int)(agentX[i] + 0.5f);
+        int iy = (int)(agentY[i] + 0.5f);
+        agents[i]->setX(ix);
+        agents[i]->setY(iy);
+
+        if (h_reached[i]) {
+            Twaypoint* next = agents[i]->getNextDestination();
+            if (next) {
+                destX[i] = next->getx(); 
+                destY[i] = next->gety(); 
+                destR[i] = next->getr();
+                destChanged = true;
+            }
+        }
+    }
+
+    if (destChanged) {
+        cudaMemcpy(d_destX, destX, pos_size, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_destY, destY, pos_size, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_destR, destR, pos_size, cudaMemcpyHostToDevice);
+    }
+    break;
+}
+
 	default:
 	break;
 	}
@@ -494,13 +497,13 @@ void Ped::Model::cleanup()
     if (destY)  _mm_free(destY);
     if (destR)  _mm_free(destR);
 
-	if (d_agentX) cudaFree(d_agentX);
-    if (d_agentY) cudaFree(d_agentY);
-    if (d_destX)  cudaFree(d_destX);
-    if (d_destY)  cudaFree(d_destY);
-	if (d_destR)  cudaFree(d_destR);
-	if (d_reached) cudaFree(d_reached);
-	if (h_reached) cudaFree(h_reached);
+	if (d_agentX)  cudaFreeHost(d_agentX);
+    if (d_agentY)  cudaFreeHost(d_agentY);
+    if (d_destX)   cudaFreeHost(d_destX);
+    if (d_destY)   cudaFreeHost(d_destY);
+	if (d_destR)   cudaFreeHost(d_destR);
+	if (d_reached) cudaFreeHost(d_reached);
+	if (h_reached) cudaFreeHost(h_reached);
 
 }
 

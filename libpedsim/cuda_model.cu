@@ -20,8 +20,8 @@ __global__ void cudaMove(float *agentX, float *agentY,
         if (sq_len > 1e-7f)
         {
             float invLen = rsqrtf(sq_len);
-            agentX[i] += dx * invLen;
-            agentY[i] += dy * invLen;
+            agentX[i] = fmaf(dx, invLen, agentX[i]);
+            agentY[i] = fmaf(dy, invLen, agentY[i]);
         }
 
         // Calculate if reached AFTER moving
