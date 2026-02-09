@@ -16,6 +16,7 @@
 #include <set>
 
 #include "ped_agent.h"
+#include <cstdint>
 
 namespace Ped{
 	class Tagent;
@@ -40,6 +41,11 @@ namespace Ped{
 		int numAgents;
 		int paddedSize;
 
+		float *d_agentX;
+		float *d_agentY;
+		float *d_destX;
+		float *d_destY;
+		float *d_destR;
 
 		// Coordinates a time step in the scenario: move all agents by one step (if applicable).
 		void tick();

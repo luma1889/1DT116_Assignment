@@ -14,9 +14,13 @@
 #include <omp.h>
 #include <thread>
 #include <cmath>
-#include <immintrin.h> 
-const unsigned int numThreads = std::thread::hardware_concurrency();
+#include <immintrin.h>
+#include <cuda_runtime.h>
 
+const unsigned int numThreads = std::thread::hardware_concurrency();
+extern "C" void cudaKernelfunction(float *d_agentX, float *d_agentY, 
+                                   float *d_destX, float *d_destY, float *d_destR,
+                                   int numAgents);
 // #define numThreads 11
 
 #ifndef NOCDUA
@@ -37,16 +41,23 @@ void Ped::Model::setup(std::vector<Ped::Tagent *> agentsInScenario, std::vector<
 	// Set up agents
 	numAgents = agentsInScenario.size();
 	paddedSize = ((numAgents + 7) / 8) * 8;
+	size_t alloc_size = paddedSize * sizeof(float);
 	
 	// Set up destinations
 	destinations = std::vector<Ped::Twaypoint *>(destinationsInScenario.begin(), destinationsInScenario.end());
 	
-	agentX = (float*)_mm_malloc(paddedSize * sizeof(float), 32); // TODO: Check if use this: sizeof(__mm256)
-	agentY = (float*)_mm_malloc(paddedSize * sizeof(float), 32);
-	destX  = (float*)_mm_malloc(paddedSize * sizeof(float), 32);
-	destY  = (float*)_mm_malloc(paddedSize * sizeof(float), 32);
-	destR  = (float*)_mm_malloc(paddedSize * sizeof(float), 32);
+	agentX = (float*)_mm_malloc(alloc_size, 32); // TODO: Check if use this: sizeof(__mm256)
+	agentY = (float*)_mm_malloc(alloc_size, 32);
+	destX  = (float*)_mm_malloc(alloc_size, 32);
+	destY  = (float*)_mm_malloc(alloc_size, 32);
+	destR  = (float*)_mm_malloc(alloc_size, 32);
 	agents = agentsInScenario;
+
+	cudaMalloc(&d_agentX, alloc_size);
+    cudaMalloc(&d_agentY, alloc_size);
+    cudaMalloc(&d_destX, alloc_size);
+    cudaMalloc(&d_destY, alloc_size);
+	cudaMalloc(&d_destR, alloc_size);
 	
 	for (size_t i = 0; i < paddedSize; ++i)
     {
@@ -66,7 +77,12 @@ void Ped::Model::setup(std::vector<Ped::Tagent *> agentsInScenario, std::vector<
 			destY[i] = 1;
             destR[i] = 0;
         }
-    }
+	}
+	cudaMemcpy(d_agentX, agentX, alloc_size, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_agentY, agentY, alloc_size, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_destX, destX, alloc_size, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_destY, destY, alloc_size, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_destR, destR, alloc_size, cudaMemcpyHostToDevice);
 
 	// Sets the chosen implemenation. Standard in the given code is SEQ
 	this->implementation = implementation;
@@ -213,6 +229,7 @@ void Ped::Model::tick()
 	case Ped::VECTOR:
 	{
 		#pragma omp parallel for schedule(static)
+		// #pragma omp simd
 		for (int i = 0; i < paddedSize; i += 8)
 		{
 			__m256 aX = _mm256_load_ps(&agentX[i]);
@@ -254,20 +271,31 @@ void Ped::Model::tick()
 			__m256 dR = _mm256_load_ps(&destR[i]);
 			__m256 mask = _mm256_cmp_ps(len, dR, _CMP_LT_OQ);	// _CMP_LT_OQ = "Less Than, Ordered, Quiet"
 
-			int bitmask = _mm256_movemask_ps(mask);
+			__m256 nextDX = _mm256_load_ps(&destX[i]);
+        	__m256 nextDY = _mm256_load_ps(&destY[i]);
+        	__m256 nextDR = _mm256_load_ps(&destR[i]);
 
-			if (bitmask != 0) {
-				for (int j = 0; j < 8; ++j) {
-					if ((bitmask >> j) & 1) {
-						Twaypoint* next = agents[i+j]->getNextDestination();
-						if (next) {
-							destX[i+j] = (float)next->getx();
-							destY[i+j] = (float)next->gety();
-							destR[i+j] = (float)next->getr();
-						}
-					}
-				}
-			}
+     		__m256 blendedDX = _mm256_blendv_ps(dX, nextDX, mask);
+        	__m256 blendedDY = _mm256_blendv_ps(dY, nextDY, mask);
+        	__m256 blendedDR = _mm256_blendv_ps(dR, nextDR, mask);
+
+     		_mm256_store_ps(&destX[i], blendedDX);
+        	_mm256_store_ps(&destY[i], blendedDY);
+        	_mm256_store_ps(&destR[i], blendedDR);
+			// int bitmask = _mm256_movemask_ps(mask);
+
+			// if (bitmask != 0) {
+			// 	for (int j = 0; j < 8; ++j) {
+			// 		if ((bitmask >> j) & 1) {
+			// 			Twaypoint* next = agents[i+j]->getNextDestination();
+			// 			if (next) {
+			// 				destX[i+j] = (float)next->getx();
+			// 				destY[i+j] = (float)next->gety();
+			// 				destR[i+j] = (float)next->getr();
+			// 			}
+			// 		}
+			// 	}
+			// }
 		}
 
 		// Unoptimized, goes to scalar everythime even though destination is not reached
@@ -325,15 +353,51 @@ void Ped::Model::tick()
 		// }
 		break;
 	}
+	case Ped::CUDA:
+	{
+		size_t alloc_size = paddedSize * sizeof(float);
+
+		cudaKernelfunction(d_agentX, d_agentY, d_destX, d_destY, d_destR, numAgents);
+
+		cudaMemcpy(agentX, d_agentX, alloc_size, cudaMemcpyDeviceToHost);
+		cudaMemcpy(agentY, d_agentY, alloc_size, cudaMemcpyDeviceToHost);
+		for (int i = numAgents; i < paddedSize; ++i) {
+			agentX[i] = 0.0f;
+			agentY[i] = 0.0f;
+		}
+
+		bool destinationsChanged = false;
+		#pragma omp parallel for reduction(|:destinationsChanged)
+		for (int i = 0; i < numAgents; i++) {
+			// if (h_reached[i]) {
+				Twaypoint* next = agents[i]->getNextDestination();
+				if (next) {
+					destX[i] = (float)next->getx();
+					destY[i] = (float)next->gety();
+					destR[i] = (float)next->getr();
+					destinationsChanged = true;
+				}
+			// }
+			agents[i]->setX((int)roundf(agentX[i]));
+			agents[i]->setY((int)roundf(agentY[i]));
+		}
+		if (destinationsChanged) {
+			cudaMemcpy(d_destX, destX, alloc_size, cudaMemcpyHostToDevice);
+			cudaMemcpy(d_destY, destY, alloc_size, cudaMemcpyHostToDevice);
+			cudaMemcpy(d_destR, destR, alloc_size, cudaMemcpyHostToDevice);
+		}
+		break;
+	}
 	default:
 	break;
 	}
 	
-	if (implementation != Ped::CUDA) {
-		#pragma omp parallel for
-		for (int k = 0; k < numAgents; ++k) {
-			agents[k]->setX((int)agentX[k]);
+	if (implementation == Ped::VECTOR) {
+        #pragma omp parallel for schedule(static)
+        for (int k = 0; k < numAgents; ++k) {
+            agents[k]->setX((int)agentX[k]);
 			agents[k]->setY((int)agentY[k]);
+
 		}
 	}
 }
@@ -422,6 +486,13 @@ void Ped::Model::cleanup()
     if (destX)  _mm_free(destX);
     if (destY)  _mm_free(destY);
     if (destR)  _mm_free(destR);
+
+	if (d_agentX) cudaFree(d_agentX);
+    if (d_agentY) cudaFree(d_agentY);
+    if (d_destX)  cudaFree(d_destX);
+    if (d_destY)  cudaFree(d_destY);
+	if (d_destR)  cudaFree(d_destR);
+
 }
 
 Ped::Model::~Model()

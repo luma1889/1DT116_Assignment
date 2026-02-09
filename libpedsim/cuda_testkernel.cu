@@ -36,11 +36,11 @@ int cuda_test()
 
 	// cudaDeviceReset must be called before exiting in order for profiling and
 	// tracing tools such as Nsight and Visual Profiler to show complete traces.
-	cudaStatus = cudaDeviceReset();
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaDeviceReset failed!\n");
-		return 1;
-	}
+	// cudaStatus = cudaDeviceReset();
+	// if (cudaStatus != cudaSuccess) {
+	// 	fprintf(stderr, "cudaDeviceReset failed!\n");
+	// 	return 1;
+	// }
 
 	return 0;
 }
