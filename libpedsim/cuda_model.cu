@@ -4,8 +4,10 @@
 #include <cstdint>
 #include "ped_model.h"
 
+// Inside your .cu file
 __global__ void cudaMove(float *agentX, float *agentY, 
-                         const float *destX, const float *destY, const float *destR, int numAgents)
+                         const float *destX, const float *destY, const float *destR, 
+                         int8_t *reached, int numAgents) // Added reached here
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -22,17 +24,20 @@ __global__ void cudaMove(float *agentX, float *agentY,
             agentY[i] += dy * invLen;
         }
 
-        float new_dx = destX[i] - agentX[i];
-        float new_dy = destY[i] - agentY[i];
+        // Calculate if reached AFTER moving
+        float nx = destX[i] - agentX[i];
+        float ny = destY[i] - agentY[i];
+        reached[i] = ((nx * nx + ny * ny) < (destR[i] * destR[i])) ? 1 : 0;
     }
 }
 
 extern "C" void cudaKernelfunction(float *d_agentX, float *d_agentY, 
-                                   float *d_destX, float *d_destY, float *d_destR, int numAgents)
+                                   float *d_destX, float *d_destY, float *d_destR,
+                                   int8_t *d_reached, int numAgents) // Match signature
 {
-
+    // Remove the semicolon that was after the function header in your snippet!
     int blockSize = 256;
     int numBlocks = (numAgents + blockSize - 1) / blockSize;
 
-    cudaMove<<<numBlocks, blockSize>>>(d_agentX, d_agentY, d_destX, d_destY, d_destR, numAgents);
+    cudaMove<<<numBlocks, blockSize>>>(d_agentX, d_agentY, d_destX, d_destY, d_destR, d_reached, numAgents);
 }

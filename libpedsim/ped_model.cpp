@@ -20,7 +20,7 @@
 const unsigned int numThreads = std::thread::hardware_concurrency();
 extern "C" void cudaKernelfunction(float *d_agentX, float *d_agentY, 
                                    float *d_destX, float *d_destY, float *d_destR,
-                                   int numAgents);
+                                   int8_t *d_reached, int numAgents);
 // #define numThreads 11
 
 #ifndef NOCDUA
@@ -355,36 +355,43 @@ void Ped::Model::tick()
 	}
 	case Ped::CUDA:
 	{
-		size_t alloc_size = paddedSize * sizeof(float);
+		// STEP 1: No cudaMemcpy(HostToDevice) for agentX/Y! 
+		// The GPU already has the values from the last tick.
 
-		cudaKernelfunction(d_agentX, d_agentY, d_destX, d_destY, d_destR, numAgents);
+		// STEP 2: Compute
+		cudaKernelfunction(d_agentX, d_agentY, d_destX, d_destY, d_destR, d_reached, numAgents);
 
-		cudaMemcpy(agentX, d_agentX, alloc_size, cudaMemcpyDeviceToHost);
-		cudaMemcpy(agentY, d_agentY, alloc_size, cudaMemcpyDeviceToHost);
-		for (int i = numAgents; i < paddedSize; ++i) {
-			agentX[i] = 0.0f;
-			agentY[i] = 0.0f;
-		}
+		// STEP 3: Only download what we need to show on screen
+		size_t transfer_size = numAgents * sizeof(float);
+		cudaMemcpyAsync(agentX, d_agentX, transfer_size, cudaMemcpyDeviceToHost);
+		cudaMemcpyAsync(agentY, d_agentY, transfer_size, cudaMemcpyDeviceToHost);
+		cudaMemcpyAsync(h_reached, d_reached, numAgents * sizeof(int8_t), cudaMemcpyDeviceToHost);
+		
+		cudaDeviceSynchronize();
 
+		// STEP 4: Logic & Destination Batching
 		bool destinationsChanged = false;
 		#pragma omp parallel for reduction(|:destinationsChanged)
 		for (int i = 0; i < numAgents; i++) {
-			// if (h_reached[i]) {
+			if (h_reached[i]) {
 				Twaypoint* next = agents[i]->getNextDestination();
 				if (next) {
-					destX[i] = (float)next->getx();
-					destY[i] = (float)next->gety();
-					destR[i] = (float)next->getr();
+					destX[i] = next->getx(); 
+					destY[i] = next->gety(); 
+					destR[i] = next->getr();
 					destinationsChanged = true;
 				}
-			// }
+			}
+			// Only do this if your GUI actually needs it every tick
 			agents[i]->setX((int)roundf(agentX[i]));
 			agents[i]->setY((int)roundf(agentY[i]));
 		}
+
+		// STEP 5: Only upload destinations IF they changed
 		if (destinationsChanged) {
-			cudaMemcpy(d_destX, destX, alloc_size, cudaMemcpyHostToDevice);
-			cudaMemcpy(d_destY, destY, alloc_size, cudaMemcpyHostToDevice);
-			cudaMemcpy(d_destR, destR, alloc_size, cudaMemcpyHostToDevice);
+			cudaMemcpy(d_destX, destX, transfer_size, cudaMemcpyHostToDevice);
+			cudaMemcpy(d_destY, destY, transfer_size, cudaMemcpyHostToDevice);
+			cudaMemcpy(d_destR, destR, transfer_size, cudaMemcpyHostToDevice);
 		}
 		break;
 	}
