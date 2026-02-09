@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<welcome>
+  <!-- 
+    INSANE SCENARIO 
+    Total Agents: 128,000
+    Designed to show CUDA scaling vs SIMD/CPU
+  -->
+
+  <!-- Corners waypoints -->
+  <waypoint id="top_left" x="0" y="0" r="20" />
+  <waypoint id="top_right" x="1000" y="0" r="20" />
+  <waypoint id="bot_left" x="0" y="1000" r="20" />
+  <waypoint id="bot_right" x="1000" y="1000" r="20" />
+
+  <!-- Flow 1: Bottom-Left to Top-Right (32,000 agents) -->
+  <agent x="50" y="950" n="32000" dx="300" dy="300">
+    <addwaypoint id="top_right" />
+    <addwaypoint id="bot_left" />
+  </agent>
+
+  <!-- Flow 2: Top-Right to Bottom-Left (32,000 agents) -->
+  <agent x="950" y="50" n="32000" dx="300" dy="300">
+    <addwaypoint id="bot_left" />
+    <addwaypoint id="top_right" />
+  </agent>
+
+  <!-- Flow 3: Top-Left to Bottom-Right (32,000 agents) -->
+  <agent x="50" y="50" n="32000" dx="300" dy="300">
+    <addwaypoint id="bot_right" />
+    <addwaypoint id="top_left" />
+  </agent>
+
+  <!-- Flow 4: Bottom-Right to Top-Left (32,000 agents) -->
+  <agent x="950" y="950" n="32000" dx="300" dy="300">
+    <addwaypoint id="top_left" />
+    <addwaypoint id="bot_right" />
+  </agent>
+
+</welcome>
