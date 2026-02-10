@@ -108,11 +108,19 @@ namespace Ped {
 		#ifdef USE_CUDA
         // CUDA data
         struct CUDAData {
-            float* d_x, *d_y, *d_destX, *d_destY, *d_destR;
-            int* d_wpIndex, *d_wpCount, *d_wpOffset;
-            float* d_wpPoolX, *d_wpPoolY, *d_wpPoolR;
-            cudaStream_t stream;
-            bool dataValid;  // Track if GPU data needs updating
+            float* d_x = nullptr;
+            float* d_y = nullptr; 
+            float* d_destX = nullptr;
+            float* d_destY = nullptr;
+            float* d_destR = nullptr;
+            int* d_wpIndex = nullptr;
+            int* d_wpCount = nullptr;
+            int* d_wpOffset = nullptr;
+            float* d_wpPoolX = nullptr;
+            float* d_wpPoolY = nullptr;
+            float* d_wpPoolR = nullptr;
+            cudaStream_t stream = nullptr;
+            bool dataValid = false;
         } cudaData;
         
         void setupCUDA();

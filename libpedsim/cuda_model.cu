@@ -82,7 +82,7 @@ extern "C" void cudaKernelfunction(
     int numAgents, cudaStream_t stream) 
 {
     // Each thread processes 4 agents
-    int threadsPerBlock = 256;
+    int threadsPerBlock = 16;
     int numBlocks = (numAgents + (threadsPerBlock * 4) - 1) / (threadsPerBlock * 4);
     
     cudaMoveKernel<<<numBlocks, threadsPerBlock, 0, stream>>>(
