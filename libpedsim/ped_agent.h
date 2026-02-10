@@ -18,62 +18,56 @@
 
 #include <vector>
 #include <deque>
-
-using namespace std;
+#include <cmath>
 
 namespace Ped {
-	class Twaypoint;
+    class Model;
+    class Twaypoint;
 
-	class Tagent {
-	public:
+    class Tagent {
+    public:
+        // Data-Oriented Design: Agent is just a handle to arrays in Model
 		Tagent(int posX, int posY);
-		Tagent(double posX, double posY);
-
-		// Returns the coordinates of the desired position
-		int getDesiredX() const { return desiredPositionX; }
-		int getDesiredY() const { return desiredPositionY; }
-
-		// Sets the agent's position
-		void setX(int newX) { x = newX; }
-		void setY(int newY) { y = newY; }
-
-		// Update the position according to get closer
-		// to the current destination
-		void computeNextDesiredPosition();
-		// Position of agent defined by x and y
-		int getX() const { return x; };
-		int getY() const { return y; };
-
-		// Adds a new waypoint to reach for this agent
-		void addWaypoint(Twaypoint* wp);
-		
-		// Returns the next destination to visit
-		Twaypoint* getNextDestination();
-
-	private:
-		Tagent() {};
-
-		// The agent's current position
-		int x;
-		int y;
-
-		// The agent's desired next position
-		int desiredPositionX;
-		int desiredPositionY;
-
-		// The current destination (may require several steps to reach)
-		Twaypoint* destination;
-
-		// The last destination
-		Twaypoint* lastDestination;
-
-		// The queue of all destinations that this agent still has to visit
-		deque<Twaypoint*> waypoints;
-
-		// Internal init function 
-		void init(int posX, int posY);
-
-	};
+        Tagent(double posX, double posY);
+        // Tagent(int posX, int posY) : id(-1), model(nullptr), x(posX), y(posY) {}
+        // Tagent(double posX, double posY) : 
+        //     id(-1), model(nullptr), x((int)round(posX)), y((int)round(posY)) {}
+        ~Tagent() {
+        // Don't access model data during destruction
+			model = nullptr;
+			id = -1;
+		}
+        // Getters/Setters - direct array access
+        int getX() const;
+        int getY() const;
+        void setX(int newX);
+        void setY(int newY);
+        
+        // For compatibility
+        int getDesiredX() const { return getX(); }
+        int getDesiredY() const { return getY(); }
+        void computeNextDesiredPosition() {}  // Handled by Model
+        
+        // Waypoint management
+        void addWaypoint(Twaypoint* wp);
+        Twaypoint* getNextDestination();
+        const std::deque<Twaypoint*>& getWaypoints() const { return tmp_waypoints; }
+        
+        // ID-based architecture
+        int getId() const { return id; }
+        void setId(int newId, Model* m) { id = newId; model = m; }
+        
+        // Temporary storage for setup
+        int getInitX() const { return init_x; }
+        int getInitY() const { return init_y; }
+        
+    private:
+        int id;             // Index in Model's arrays
+        Model* model;       // Pointer to source of truth
+        int init_x, init_y; // Initial positions
+        std::deque<Twaypoint*> tmp_waypoints;  // Only used during setup
+        
+        void init(int posX, int posY);
+    };
 }
-
 #endif

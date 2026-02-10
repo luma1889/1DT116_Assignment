@@ -8,74 +8,82 @@
 // time step all agents need to be moved by one position if
 // possible.
 //
+
 #ifndef _ped_model_h_
 #define _ped_model_h_
 
 #include <vector>
 #include <map>
 #include <set>
-
-#include "ped_agent.h"
 #include <cstdint>
+#include "ped_agent.h"
 
-namespace Ped{
-	class Tagent;
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
 
-	// The implementation modes for Assignment 1 + 2:
-	// chooses which implementation to use for tick()
-	enum IMPLEMENTATION { CUDA, VECTOR, OMP, PTHREAD, SEQ };
+namespace Ped {
+    class Tagent;
 
-	class Model
-	{
-	public:
+    enum IMPLEMENTATION { CUDA, VECTOR, OMP, PTHREAD, SEQ };
 
-		// Sets everything up
-		void setup(std::vector<Tagent*> agentsInScenario, std::vector<Twaypoint*> destinationsInScenario,IMPLEMENTATION implementation);
+    class Model {
+    public:
+        // Data-Oriented Structure
+        struct AgentArrays {
+            // Primary arrays (aligned for SIMD)
+            float* x;           // Current X positions
+            float* y;           // Current Y positions
+            float* destX;       // Current destination X
+            float* destY;       // Current destination Y
+            float* destR;       // Current destination radius
+            int* wpIndex;       // Current waypoint index
+            int* wpCount;       // Total waypoints per agent
+            int* wpOffset;      // Start index in waypoint pool
+            
+            // Waypoint pool (contiguous memory)
+            float* wpPoolX;
+            float* wpPoolY;
+            float* wpPoolR;
+            int wpPoolSize;
+            
+            int count;          // Actual agent count
+            int paddedCount;    // Padded to multiple of 8 for AVX2
+        };
 
+        void setup(std::vector<Tagent*> agentsInScenario,
+                   std::vector<Twaypoint*> destinationsInScenario,
+                   IMPLEMENTATION implementation);
+        void tick();
+        const std::vector<Tagent*>& getAgents() const { return agents; };
+        void cleanup();
+        ~Model();
 
-		float *agentX;
-		float *agentY;
-		float *destX;
-		float *destY;
-		float *destR;
-		int numAgents;
-		int paddedSize;
+        // Public data for direct access
+        AgentArrays agentData;
 
-		float *d_agentX;
-		float *d_agentY;
-		float *d_destX;
-		float *d_destY;
-		float *d_destR;
-
-		// Coordinates a time step in the scenario: move all agents by one step (if applicable).
-		void tick();
-
-		// Returns the agents of this scenario
-		const std::vector<Tagent*>& getAgents() const { return agents; };
-
-		// Adds an agent to the tree structure
-		void placeAgent(const Ped::Tagent *a);
-
-		// Cleans up the tree and restructures it. Worth calling every now and then.
-		void cleanup();
-		~Model();
-
-		// Returns the heatmap visualizing the density of agents
 		int const * const * getHeatmap() const { return blurred_heatmap; };
 		int getHeatmapSize() const;
 
-	private:
+		void placeAgent(const Ped::Tagent *a);
 
-		// Denotes which implementation (sequential, parallel implementations..)
-		// should be used for calculating the desired positions of
-		// agents (Assignment 1)
-		IMPLEMENTATION implementation;
-
-		// The agents in this scenario
-		std::vector<Tagent*> agents;
-
-		// The waypoints in this scenario
+    private:
+        IMPLEMENTATION implementation;
+        std::vector<Tagent*> agents;
 		std::vector<Twaypoint*> destinations;
+		bool isCleaned;
+        
+        // Implementation methods
+        void tickSEQ();
+        void tickOMP();
+        void tickPTHREAD();
+        void tickVECTOR();
+        void tickCUDA();
+        
+        // Setup helpers
+        void allocateArrays();
+        void buildWaypointPool();
+        void initializeArrays();
 
 		// Moves an agent towards its next position
 		void move(Ped::Tagent *agent);
@@ -85,11 +93,25 @@ namespace Ped{
 		///////////////////////////////////////////////
 
 		// Returns the set of neighboring agents for the specified position
-		set<const Ped::Tagent*> getNeighbors(int x, int y, int dist) const;
+		std::set<const Ped::Tagent*> getNeighbors(int x, int y, int dist) const;
 
 		////////////
 		/// Everything below here won't be relevant until Assignment 4
 		///////////////////////////////////////////////
+
+		#ifdef USE_CUDA
+        // CUDA data
+        struct CUDAData {
+            float* d_x, *d_y, *d_destX, *d_destY, *d_destR;
+            int* d_wpIndex, *d_wpCount, *d_wpOffset;
+            float* d_wpPoolX, *d_wpPoolY, *d_wpPoolR;
+            cudaStream_t stream;
+            bool dataValid;  // Track if GPU data needs updating
+        } cudaData;
+        
+        void setupCUDA();
+        void cleanupCUDA();
+        #endif
 
 #define SIZE 1024
 #define CELLSIZE 5
@@ -106,6 +128,6 @@ namespace Ped{
 
 		void setupHeatmapSeq();
 		void updateHeatmapSeq();
-	};
+    };
 }
 #endif

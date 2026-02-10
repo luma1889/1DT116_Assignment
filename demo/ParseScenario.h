@@ -26,7 +26,7 @@ class ParseScenario
 public:
 	ParseScenario() {}
 	ParseScenario(std::string filename, bool verbose = false);
-	~ParseScenario() {}
+	~ParseScenario() { agents.clear(); tempAgents.clear(); }
 
 	// returns the collection of agents defined by this scenario
 	vector<Ped::Tagent*> getAgents() const;

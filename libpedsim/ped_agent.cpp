@@ -6,69 +6,63 @@
 // Adapted for Low Level Parallel Programming 2017
 //
 #include "ped_agent.h"
+#include "ped_model.h"
 #include "ped_waypoint.h"
 #include <math.h>
 
-#include <stdlib.h>
-
 Ped::Tagent::Tagent(int posX, int posY) {
-	Ped::Tagent::init(posX, posY);
+    init(posX, posY);
 }
 
 Ped::Tagent::Tagent(double posX, double posY) {
-	Ped::Tagent::init((int)round(posX), (int)round(posY));
+    init((int)round(posX), (int)round(posY));
 }
 
 void Ped::Tagent::init(int posX, int posY) {
-	x = posX;
-	y = posY;
-	destination = NULL;
-	lastDestination = NULL;
+    id = -1;
+    model = nullptr;
+    init_x = posX;
+    init_y = posY;
 }
 
-void Ped::Tagent::computeNextDesiredPosition() {
-	destination = getNextDestination();
-	if (destination == NULL) {
-		// no destination, no need to
-		// compute where to move to
-		return;
-	}
+int Ped::Tagent::getX() const {
+    if (model && id >= 0) {
+        // Direct array access - no sync needed!
+        return (int)model->agentData.x[id];
+    }
+    return init_x;  // Fallback during setup
+}
 
-	double diffX = destination->getx() - x;
-	double diffY = destination->gety() - y;
-	double len = sqrt(diffX * diffX + diffY * diffY);
-	desiredPositionX = (int)round(x + diffX / len);
-	desiredPositionY = (int)round(y + diffY / len);
+int Ped::Tagent::getY() const {
+    if (model && id >= 0) {
+        return (int)model->agentData.y[id];
+    }
+    return init_y;
+}
+
+void Ped::Tagent::setX(int newX) {
+    if (model && id >= 0) {
+        model->agentData.x[id] = (float)newX;
+    } else {
+        init_x = newX;
+    }
+}
+
+void Ped::Tagent::setY(int newY) {
+    if (model && id >= 0) {
+        model->agentData.y[id] = (float)newY;
+    } else {
+        init_y = newY;
+    }
 }
 
 void Ped::Tagent::addWaypoint(Twaypoint* wp) {
-	waypoints.push_back(wp);
+    tmp_waypoints.push_back(wp);
 }
 
 Ped::Twaypoint* Ped::Tagent::getNextDestination() {
-	Ped::Twaypoint* nextDestination = NULL;
-	bool agentReachedDestination = false;
-
-	if (destination != NULL) {
-		// compute if agent reached its current destination
-		double diffX = destination->getx() - x;
-		double diffY = destination->gety() - y;
-		double length = sqrt(diffX * diffX + diffY * diffY);
-		agentReachedDestination = length < destination->getr();
-	}
-
-	if ((agentReachedDestination || destination == NULL) && !waypoints.empty()) {
-		// Case 1: agent has reached destination (or has no current destination);
-		// get next destination if available
-		waypoints.push_back(destination);
-		nextDestination = waypoints.front();
-		waypoints.pop_front();
-	}
-	else {
-		// Case 2: agent has not yet reached destination, continue to move towards
-		// current destination
-		nextDestination = destination;
-	}
-
-	return nextDestination;
+    if (!tmp_waypoints.empty()) {
+        return tmp_waypoints.front();
+    }
+    return nullptr;
 }

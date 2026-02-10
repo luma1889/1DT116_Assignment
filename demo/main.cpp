@@ -166,40 +166,42 @@ int main(int argc, char*argv[]) {
         // Run twice, without the gui, to compare the runtimes.
         if (timing_mode) {
             // Run sequentially
+            if (timing_mode) {
             double fps_seq, fps_target;
             {
+                ParseScenario parser(scenefile);  // Move OUTSIDE model scope
                 Ped::Model model;
-                ParseScenario parser(scenefile);
                 model.setup(parser.getAgents(), parser.getWaypoints(), Ped::SEQ);
                 Simulation *simulation = new TimingSimulation(model, max_steps);
 
-                // Simulation mode to use when profiling (without any GUI)
                 std::cout << "Running reference version...\n";
                 auto start = std::chrono::steady_clock::now();
                 simulation->runSimulation();
-                auto duration_seq = std::chrono::duration_cast<std::chrono::milliseconds> (std::chrono::steady_clock::now() - start);
+                auto duration_seq = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
                 fps_seq = ((float)simulation->getTickCount()) / ((float)duration_seq.count())*1000.0;
                 cout << "Reference time: " << duration_seq.count() << " milliseconds, " << fps_seq << " Frames Per Second." << std::endl;
 
                 delete simulation;
+                // model destructor called here, THEN parser destructor
             }
 
             {
-                Ped::Model model;
                 ParseScenario parser(scenefile);
+                Ped::Model model;
                 model.setup(parser.getAgents(), parser.getWaypoints(), implementation_to_test);
                 Simulation *simulation = new TimingSimulation(model, max_steps);
-                // Simulation mode to use when profiling (without any GUI)
+                
                 std::cout << "Running target version...\n";
                 auto start = std::chrono::steady_clock::now();
                 simulation->runSimulation();
-                auto duration_target = std::chrono::duration_cast<std::chrono::milliseconds> (std::chrono::steady_clock::now() - start);
+                auto duration_target = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
                 fps_target = ((float)simulation->getTickCount()) / ((float)duration_target.count())*1000.0;
                 cout << "Target time: " << duration_target.count() << " milliseconds, " << fps_target << " Frames Per Second." << std::endl;
 
                 delete simulation;
             }
             std::cout << "\n\nSpeedup: " << fps_target / fps_seq << std::endl;
+        }
         } else if (export_trace) {
                 Ped::Model model;
                 ParseScenario parser(scenefile);

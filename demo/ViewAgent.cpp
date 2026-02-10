@@ -33,6 +33,11 @@ ViewAgent::ViewAgent(Ped::Tagent * agent, QGraphicsScene * scene) : agent(agent)
 }
 
 void ViewAgent::paint(QColor color){
+
+	if (!agent) return;
+
+    int x = agent->getX();
+    int y = agent->getY();
 	
 	if(bgt_icon)
 		bgt_icon->setPos(MainWindow::cellToPixel(agent->getX()), MainWindow::cellToPixel(agent->getY()));

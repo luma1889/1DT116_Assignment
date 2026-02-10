@@ -7,400 +7,417 @@
 //
 #include "ped_model.h"
 #include "ped_waypoint.h"
-#include "ped_model.h"
 #include <iostream>
-#include <stack>
 #include <algorithm>
-#include <omp.h>
-#include <thread>
 #include <cmath>
 #include <immintrin.h>
+#include <thread>
+#include <omp.h>
+#include <cstdlib>
+#include <cstring>
+
+#ifdef USE_CUDA
 #include <cuda_runtime.h>
-
-const unsigned int numThreads = std::thread::hardware_concurrency();
-extern "C" void cudaKernelfunction(float *d_agentX, float *d_agentY, 
-                                   float *d_destX, float *d_destY, float *d_destR,
-                                   int numAgents);
-// #define numThreads 11
-
-#ifndef NOCDUA
-#include "cuda_testkernel.h"
+// Declare CUDA kernel function instead of including header
+extern "C" void cudaKernelfunction(float* d_x, float* d_y, 
+                                   float* d_destX, float* d_destY, float* d_destR,
+                                   int* d_wpIndex, const int* d_wpCount, const int* d_wpOffset,
+                                   const float* d_wpPoolX, const float* d_wpPoolY, const float* d_wpPoolR,
+                                   int numAgents, cudaStream_t stream);
 #endif
 
-#include <stdlib.h>
+// Alignment for AVX2 (32 bytes)
+#define ALIGNMENT 32
+#define AGENTS_PER_VECTOR 8
 
-void Ped::Model::setup(std::vector<Ped::Tagent *> agentsInScenario, std::vector<Twaypoint *> destinationsInScenario, IMPLEMENTATION implementation)
-{
-#ifndef NOCUDA
-	// Convenience test: does CUDA work on this machine?
-	cuda_test();
-#else
-	std::cout << "Not compiled for CUDA" << std::endl;
-#endif
-
-	// Set up agents
-	numAgents = agentsInScenario.size();
-	paddedSize = ((numAgents + 7) / 8) * 8;
-	size_t alloc_size = paddedSize * sizeof(float);
-	
-	// Set up destinations
-	destinations = std::vector<Ped::Twaypoint *>(destinationsInScenario.begin(), destinationsInScenario.end());
-	
-	agentX = (float*)_mm_malloc(alloc_size, 32); // TODO: Check if use this: sizeof(__mm256)
-	agentY = (float*)_mm_malloc(alloc_size, 32);
-	destX  = (float*)_mm_malloc(alloc_size, 32);
-	destY  = (float*)_mm_malloc(alloc_size, 32);
-	destR  = (float*)_mm_malloc(alloc_size, 32);
-	agents = agentsInScenario;
-
-	cudaMalloc(&d_agentX, alloc_size);
-    cudaMalloc(&d_agentY, alloc_size);
-    cudaMalloc(&d_destX, alloc_size);
-    cudaMalloc(&d_destY, alloc_size);
-	cudaMalloc(&d_destR, alloc_size);
-	
-	for (size_t i = 0; i < paddedSize; ++i)
-    {
-        if (i < numAgents) {
-            agentX[i] = agents[i]->getX();
-            agentY[i] = agents[i]->getY();
-            Twaypoint* wp = agents[i]->getNextDestination();
-            if (wp) {
-                destX[i] = wp->getx();
-                destY[i] = wp->gety();
-                destR[i] = wp->getr();
-            }
-        } else {
-            agentX[i] = 0;
-			agentY[i] = 0;
-            destX[i] = 1;
-			destY[i] = 1;
-            destR[i] = 0;
-        }
-	}
-	cudaMemcpy(d_agentX, agentX, alloc_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_agentY, agentY, alloc_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_destX, destX, alloc_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_destY, destY, alloc_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_destR, destR, alloc_size, cudaMemcpyHostToDevice);
-
-	// Sets the chosen implemenation. Standard in the given code is SEQ
-	this->implementation = implementation;
-
-	// Set up heatmap (relevant for Assignment 4)
-	setupHeatmapSeq();
+template<typename T>
+T* aligned_alloc(size_t count) {
+    return static_cast<T*>(_mm_malloc(count * sizeof(T), ALIGNMENT));
 }
 
-void work(Ped::Model* model, int start, int end)
-{
-    for (int i = start; i < end; ++i)
-    {
-        float dx = model->destX[i] - model->agentX[i];
-        float dy = model->destY[i] - model->agentY[i];
-        float len = sqrt(dx * dx + dy * dy);
+void Ped::Model::setup(std::vector<Tagent*> agentsInScenario,
+                       std::vector<Twaypoint*> destinationsInScenario,
+                       IMPLEMENTATION implementation) {
+    this->implementation = implementation;
+    this->agents = agentsInScenario;
+    this->destinations = destinationsInScenario;
+    this->isCleaned = false;
+    
+    // Setup ID-based architecture
+    for (int i = 0; i < (int)agents.size(); ++i) {
+        agents[i]->setId(i, this);
+    }
+    
+    // Allocate and initialize arrays
+    allocateArrays();
+    buildWaypointPool();
+    initializeArrays();
+    
+    // CUDA-specific setup
+    if (implementation == CUDA) {
+        #ifdef USE_CUDA
+        setupCUDA();
+        #endif
+    }
+    
+    // setupHeatmapSeq();
+}
 
-        if (len > 0) {
-            model->agentX[i] += dx / len;
-            model->agentY[i] += dy / len;
-        }
+void Ped::Model::allocateArrays() {
+    agentData.count = agents.size();
+    agentData.paddedCount = ((agentData.count + AGENTS_PER_VECTOR - 1) / AGENTS_PER_VECTOR) * AGENTS_PER_VECTOR;
+    
+    // Use cudaMallocHost for ALL arrays - it's pinned and aligned
+    cudaMallocHost(&agentData.x, agentData.paddedCount * sizeof(float));
+    cudaMallocHost(&agentData.y, agentData.paddedCount * sizeof(float));
+    cudaMallocHost(&agentData.destX, agentData.paddedCount * sizeof(float));
+    cudaMallocHost(&agentData.destY, agentData.paddedCount * sizeof(float));
+    cudaMallocHost(&agentData.destR, agentData.paddedCount * sizeof(float));
+    cudaMallocHost(&agentData.wpIndex, agentData.paddedCount * sizeof(int));
+    cudaMallocHost(&agentData.wpCount, agentData.paddedCount * sizeof(int));
+    cudaMallocHost(&agentData.wpOffset, agentData.paddedCount * sizeof(int));
+    
+    // Initialize all pointers to nullptr
+    agentData.wpPoolX = nullptr;
+    agentData.wpPoolY = nullptr;
+    agentData.wpPoolR = nullptr;
+}
 
-        if (len < model->destR[i]) {
-            Ped::Twaypoint* next = model->getAgents()[i]->getNextDestination();
-            if (next) {
-                model->destX[i] = (float)next->getx();
-                model->destY[i] = (float)next->gety();
-                model->destR[i] = (float)next->getr();
+void Ped::Model::buildWaypointPool() {
+    // Count total waypoints
+    int totalWaypoints = 0;
+    for (auto agent : agents) {
+        totalWaypoints += std::max(1, (int)agent->getWaypoints().size());
+    }
+    
+    agentData.wpPoolSize = totalWaypoints;
+    
+    // Use cudaMallocHost for consistency
+    cudaMallocHost(&agentData.wpPoolX, totalWaypoints * sizeof(float));
+    cudaMallocHost(&agentData.wpPoolY, totalWaypoints * sizeof(float));
+    cudaMallocHost(&agentData.wpPoolR, totalWaypoints * sizeof(float));
+    
+    // Fill waypoint pool
+    int offset = 0;
+    for (int i = 0; i < agentData.count; ++i) {
+        agentData.wpOffset[i] = offset;
+        agentData.wpIndex[i] = 0;
+        
+        const auto& waypoints = agents[i]->getWaypoints();
+        agentData.wpCount[i] = std::max(1, (int)waypoints.size());
+        
+        if (waypoints.empty()) {
+            // No waypoints - stay in place
+            agentData.wpPoolX[offset] = (float)agents[i]->getInitX();
+            agentData.wpPoolY[offset] = (float)agents[i]->getInitY();
+            agentData.wpPoolR[offset] = 1.0f;
+            offset++;
+        } else {
+            for (auto wp : waypoints) {
+                agentData.wpPoolX[offset] = (float)wp->getx();
+                agentData.wpPoolY[offset] = (float)wp->gety();
+                agentData.wpPoolR[offset] = (float)wp->getr();
+                offset++;
             }
         }
     }
 }
 
-// void work(const std::vector<Ped::Tagent *> &agents, size_t start, size_t end)
-// {
-// 	for (size_t i = start; i < end; ++i)
-// 	{
-// 		agents[i]->computeNextDesiredPosition();
-// 		agents[i]->setX(agents[i]->getDesiredX());
-// 		agents[i]->setY(agents[i]->getDesiredY());
-// 	}
-// }
-
-void Ped::Model::tick()
-{
-	// EDIT HERE FOR ASSIGNMENT 1
-	// enum IMPLEMENTATION { CUDA, VECTOR, OMP, PTHREAD, SEQ };
-
-	switch (implementation)
-	{
-
-	case Ped::SEQ:
-    {
-        for (int i = 0; i < numAgents; ++i)
-        {
-            float dx = destX[i] - agentX[i];
-            float dy = destY[i] - agentY[i];
-            float len = sqrt(dx * dx + dy * dy);
-
-            if (len > 0) {
-                agentX[i] += dx / len;
-                agentY[i] += dy / len;
-            }
-
-            if (len < destR[i]) {
-                Twaypoint* next = agents[i]->getNextDestination();
-                if (next) {
-                    destX[i] = (float)next->getx();
-                    destY[i] = (float)next->gety();
-                    destR[i] = (float)next->getr();
-                }
-            }
-			agents[i]->setX((int)round(agentX[i]));
-			agents[i]->setY((int)round(agentY[i]));
-        }
-		break;
-	}
-
-	case Ped::OMP:
-    {
-        #pragma omp parallel for
-        for (int i = 0; i < numAgents; ++i)
-        {
-            float dx = destX[i] - agentX[i];
-            float dy = destY[i] - agentY[i];
-            float len = sqrt(dx * dx + dy * dy);
-
-            if (len > 0) {
-                agentX[i] += dx / len;
-                agentY[i] += dy / len;
-            }
-
-            if (len < destR[i]) {
-                Twaypoint* next = agents[i]->getNextDestination();
-                if (next) {
-                    destX[i] = (float)next->getx();
-                    destY[i] = (float)next->gety();
-                    destR[i] = (float)next->getr();
-                }
-            }
-			agents[i]->setX((int)round(agentX[i]));
-			agents[i]->setY((int)round(agentY[i]));
-        }
-		break;
-	}
-
-	case Ped::PTHREAD:
-	{
-
-		const char *env_t = std::getenv("PTHREAD_NUM_THREADS");
-		int numThreads = (env_t != NULL) ? std::stoi(env_t) : 1;
-
-		if (numThreads < 1) numThreads = 1;
-		
-		int chunksize = (numAgents + numThreads - 1) / numThreads;
-		std::vector<std::thread> workers;
-		// std::thread *workers = new std::thread[numThreads];
-
-		for (size_t i = 0; i < numThreads; i++)
-		{
-			int start = i * chunksize;
-			int end = std::min(start + chunksize, numAgents);
-
-			if (start < end)
-			{
-				workers.emplace_back(work, this, start, end);
-				// workers[i] = std::thread(work, std::ref(agents), start, end);
-			}
-		}
-		for (auto& t : workers)
-		{
-			if (t.joinable())
-			{
-				t.join();
-			}
-		}
-		#pragma omp parallel for
-		for (int k = 0; k < numAgents; ++k) {
-			agents[k]->setX((int)round(agentX[k]));
-			agents[k]->setY((int)round(agentY[k]));
-		}
-		// delete[] workers;
-		break;
-	}
-	case Ped::VECTOR:
-	{
-		#pragma omp parallel for schedule(static)
-		// #pragma omp simd
-		for (int i = 0; i < paddedSize; i += 8)
-		{
-			__m256 aX = _mm256_load_ps(&agentX[i]);
-			__m256 aY = _mm256_load_ps(&agentY[i]);
-			__m256 dX = _mm256_load_ps(&destX[i]);
-			__m256 dY = _mm256_load_ps(&destY[i]);
-
-			__m256 diffX = _mm256_sub_ps(dX, aX);
-			__m256 diffY = _mm256_sub_ps(dY, aY);
-
-			__m256 sq_len = _mm256_mul_ps(diffX, diffX);
-			sq_len = _mm256_fmadd_ps(diffY, diffY, sq_len);
-			
-			// __m256 len = _mm256_sqrt_ps(sq_len);
-			// __m256 nextX = _mm256_add_ps(aX, _mm256_div_ps(diffX, len));
-			// __m256 nextY = _mm256_add_ps(aY, _mm256_div_ps(diffY, len));
-			__m256 invLen = _mm256_rsqrt_ps(sq_len);
-
-			__m256 nextX = _mm256_fmadd_ps(diffX, invLen, aX);
-			__m256 nextY = _mm256_fmadd_ps(diffY, invLen, aY);
-
-			__m256 roundedX = _mm256_round_ps(nextX, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-			__m256 roundedY = _mm256_round_ps(nextY, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-
-			_mm256_store_ps (&agentX[i], roundedX);
-			_mm256_store_ps (&agentY[i], roundedY);
-
-			// for (int j = 0; j < 8; j++)
-			// {
-			// 	if ((i + j) < numAgents) {
-			// 		agents[i+j]->setX((int)agentX[i+j]);
-			// 		agents[i+j]->setY((int)agentY[i+j]);
-			// 	}
-			// }
-			
-
-			// Optimized so we only go into scalar if we have reached destination
-			__m256 len = _mm256_mul_ps(sq_len, invLen);
-			__m256 dR = _mm256_load_ps(&destR[i]);
-			__m256 mask = _mm256_cmp_ps(len, dR, _CMP_LT_OQ);	// _CMP_LT_OQ = "Less Than, Ordered, Quiet"
-
-			__m256 nextDX = _mm256_load_ps(&destX[i]);
-        	__m256 nextDY = _mm256_load_ps(&destY[i]);
-        	__m256 nextDR = _mm256_load_ps(&destR[i]);
-
-     		__m256 blendedDX = _mm256_blendv_ps(dX, nextDX, mask);
-        	__m256 blendedDY = _mm256_blendv_ps(dY, nextDY, mask);
-        	__m256 blendedDR = _mm256_blendv_ps(dR, nextDR, mask);
-
-     		_mm256_store_ps(&destX[i], blendedDX);
-        	_mm256_store_ps(&destY[i], blendedDY);
-        	_mm256_store_ps(&destR[i], blendedDR);
-			// int bitmask = _mm256_movemask_ps(mask);
-
-			// if (bitmask != 0) {
-			// 	for (int j = 0; j < 8; ++j) {
-			// 		if ((bitmask >> j) & 1) {
-			// 			Twaypoint* next = agents[i+j]->getNextDestination();
-			// 			if (next) {
-			// 				destX[i+j] = (float)next->getx();
-			// 				destY[i+j] = (float)next->gety();
-			// 				destR[i+j] = (float)next->getr();
-			// 			}
-			// 		}
-			// 	}
-			// }
-		}
-
-		// Unoptimized, goes to scalar everythime even though destination is not reached
-
-		// float dists[8];
-        // _mm256_storeu_ps(dists, len);
+void Ped::Model::initializeArrays() {
+    // Initialize arrays with agent data
+    for (int i = 0; i < agentData.count; ++i) {
+        agentData.x[i] = (float)agents[i]->getInitX();
+        agentData.y[i] = (float)agents[i]->getInitY();
         
-        // for (int j = 0; j < 8; ++j) {
-        //     // Update the actual object position for GUI
-        //     agents[i+j]->setX((int)agentX[i+j]);
-        //     agents[i+j]->setY((int)agentY[i+j]);
-
-        //     // If reached destination, get next one and update SoA arrays
-        //     if (dists[j] < destR[i+j]) {
-        //         Twaypoint* next = agents[i+j]->getNextDestination();
-        //         if (next) {
-        //             destX[i+j] = (float)next->getx();
-        //             destY[i+j] = (float)next->gety();
-        //             destR[i+j] = (float)next->getr();
-        //         }
-        //     }
-		
-		// For (numAgents % 8)
-		// int remainder_start = (numAgents / 8) * 8;
-		// for (int i = remainder_start; i < numAgents; ++i)
-		// {
-
-		// 	float dx = destX[i] - agentX[i];
-		// 	float dy = destY[i] - agentY[i];
-		// 	float len = sqrt(dx*dx + dy*dy);
-			
-		// 	float rx = (int)round(agentX[i] + dx / len);
-		// 	float ry = (int)round(agentY[i] + dy / len);
-			
-		// 	agentX[i] = rx;
-        // 	agentY[i] = ry;
-
-		// 	agents[i]->setX((int)rx);
-    	// 	agents[i]->setY((int)ry);
-
-		// 	// agents[i]->computeNextDesiredPosition();
-		// 	// agents[i]->setX(agents[i]->getDesiredX());
-		// 	// agents[i]->setY(agents[i]->getDesiredY());
-
-		// 	if (len < destR[i]) {
-		// 		Twaypoint* next = agents[i]->getNextDestination();
-		// 		if (next) {
-		// 			destX[i] = (float)next->getx();
-		// 			destY[i] = (float)next->gety();
-		// 			destR[i] = (float)next->getr();
-		// 		}
-		// 	}
-			
-
-		// }
-		break;
-	}
-	case Ped::CUDA:
-	{
-		size_t alloc_size = paddedSize * sizeof(float);
-
-		cudaKernelfunction(d_agentX, d_agentY, d_destX, d_destY, d_destR, numAgents);
-
-		cudaMemcpy(agentX, d_agentX, alloc_size, cudaMemcpyDeviceToHost);
-		cudaMemcpy(agentY, d_agentY, alloc_size, cudaMemcpyDeviceToHost);
-		for (int i = numAgents; i < paddedSize; ++i) {
-			agentX[i] = 0.0f;
-			agentY[i] = 0.0f;
-		}
-
-		bool destinationsChanged = false;
-		#pragma omp parallel for reduction(|:destinationsChanged)
-		for (int i = 0; i < numAgents; i++) {
-			// if (h_reached[i]) {
-				Twaypoint* next = agents[i]->getNextDestination();
-				if (next) {
-					destX[i] = (float)next->getx();
-					destY[i] = (float)next->gety();
-					destR[i] = (float)next->getr();
-					destinationsChanged = true;
-				}
-			// }
-			agents[i]->setX((int)roundf(agentX[i]));
-			agents[i]->setY((int)roundf(agentY[i]));
-		}
-		if (destinationsChanged) {
-			cudaMemcpy(d_destX, destX, alloc_size, cudaMemcpyHostToDevice);
-			cudaMemcpy(d_destY, destY, alloc_size, cudaMemcpyHostToDevice);
-			cudaMemcpy(d_destR, destR, alloc_size, cudaMemcpyHostToDevice);
-		}
-		break;
-	}
-	default:
-	break;
-	}
-	
-	if (implementation == Ped::VECTOR) {
-        #pragma omp parallel for schedule(static)
-        for (int k = 0; k < numAgents; ++k) {
-            agents[k]->setX((int)agentX[k]);
-			agents[k]->setY((int)agentY[k]);
-
-		}
-	}
+        // Set initial destination
+        int wpIdx = agentData.wpOffset[i] + agentData.wpIndex[i];
+        agentData.destX[i] = agentData.wpPoolX[wpIdx];
+        agentData.destY[i] = agentData.wpPoolY[wpIdx];
+        agentData.destR[i] = agentData.wpPoolR[wpIdx];
+    }
+    
+    // Pad remaining elements
+    for (int i = agentData.count; i < agentData.paddedCount; ++i) {
+        agentData.x[i] = 0.0f;
+        agentData.y[i] = 0.0f;
+        agentData.destX[i] = 0.0f;
+        agentData.destY[i] = 0.0f;
+        agentData.destR[i] = 1.0f;
+        agentData.wpIndex[i] = 0;
+        agentData.wpCount[i] = 1;
+        agentData.wpOffset[i] = 0;
+    }
 }
+
+void Ped::Model::tick() {
+    switch (implementation) {
+        case SEQ: tickSEQ(); break;
+        case OMP: tickOMP(); break;
+        case PTHREAD: tickPTHREAD(); break;
+        case VECTOR: tickVECTOR(); break;
+        case CUDA: tickCUDA(); break;
+    }
+    // updateHeatmapSeq();
+}
+
+// Optimized sequential implementation
+void Ped::Model::tickSEQ() {
+    for (int i = 0; i < agentData.count; ++i) {
+        float dx = agentData.destX[i] - agentData.x[i];
+        float dy = agentData.destY[i] - agentData.y[i];
+        float distSq = dx * dx + dy * dy;
+        
+        if (distSq > 1e-10f) {
+            float invDist = 1.0f / sqrtf(distSq);
+            agentData.x[i] += dx * invDist;
+            agentData.y[i] += dy * invDist;
+        }
+        
+        dx = agentData.destX[i] - agentData.x[i];
+        dy = agentData.destY[i] - agentData.y[i];
+        if ((dx * dx + dy * dy) < (agentData.destR[i] * agentData.destR[i])) {
+            if (agentData.wpCount[i] > 0) {
+                agentData.wpIndex[i] = (agentData.wpIndex[i] + 1) % agentData.wpCount[i];
+                int poolIdx = agentData.wpOffset[i] + agentData.wpIndex[i];
+                agentData.destX[i] = agentData.wpPoolX[poolIdx];
+                agentData.destY[i] = agentData.wpPoolY[poolIdx];
+                agentData.destR[i] = agentData.wpPoolR[poolIdx];
+            }
+        }
+    }
+}
+
+// Optimized OpenMP implementation
+void Ped::Model::tickOMP() {
+    #pragma omp parallel for
+    for (int i = 0; i < agentData.count; ++i) {
+        float dx = agentData.destX[i] - agentData.x[i];
+        float dy = agentData.destY[i] - agentData.y[i];
+        float distSq = dx * dx + dy * dy;
+        
+        if (distSq > 1e-10f) {
+            float invDist = 1.0f / sqrtf(distSq);
+            agentData.x[i] += dx * invDist;
+            agentData.y[i] += dy * invDist;
+        }
+        
+        dx = agentData.destX[i] - agentData.x[i];
+        dy = agentData.destY[i] - agentData.y[i];
+        if ((dx * dx + dy * dy) < (agentData.destR[i] * agentData.destR[i])) {
+            if (agentData.wpCount[i] > 0) {
+                agentData.wpIndex[i] = (agentData.wpIndex[i] + 1) % agentData.wpCount[i];
+                int poolIdx = agentData.wpOffset[i] + agentData.wpIndex[i];
+                agentData.destX[i] = agentData.wpPoolX[poolIdx];
+                agentData.destY[i] = agentData.wpPoolY[poolIdx];
+                agentData.destR[i] = agentData.wpPoolR[poolIdx];
+            }
+        }
+    }
+}
+
+// PThread implementation
+void Ped::Model::tickPTHREAD() {
+    const int num_threads = std::thread::hardware_concurrency();
+    std::vector<std::thread> threads;
+    int chunk_size = (agentData.count + num_threads - 1) / num_threads;
+    
+    auto worker = [this](int start, int end) {
+        for (int i = start; i < end; ++i) {
+            float dx = agentData.destX[i] - agentData.x[i];
+            float dy = agentData.destY[i] - agentData.y[i];
+            float distSq = dx * dx + dy * dy;
+            
+            if (distSq > 1e-10f) {
+                float invDist = 1.0f / sqrtf(distSq);
+                agentData.x[i] += dx * invDist;
+                agentData.y[i] += dy * invDist;
+            }
+            
+            dx = agentData.destX[i] - agentData.x[i];
+            dy = agentData.destY[i] - agentData.y[i];
+            if ((dx * dx + dy * dy) < (agentData.destR[i] * agentData.destR[i])) {
+                if (agentData.wpCount[i] > 0) {
+                    agentData.wpIndex[i] = (agentData.wpIndex[i] + 1) % agentData.wpCount[i];
+                    int poolIdx = agentData.wpOffset[i] + agentData.wpIndex[i];
+                    agentData.destX[i] = agentData.wpPoolX[poolIdx];
+                    agentData.destY[i] = agentData.wpPoolY[poolIdx];
+                    agentData.destR[i] = agentData.wpPoolR[poolIdx];
+                }
+            }
+        }
+    };
+    
+    for (int t = 0; t < num_threads; ++t) {
+        int start = t * chunk_size;
+        int end = std::min(start + chunk_size, agentData.count);
+        if (start < end) {
+            threads.emplace_back(worker, start, end);
+        }
+    }
+    
+    for (auto& t : threads) t.join();
+}
+
+// OPTIMIZED VECTOR IMPLEMENTATION (Fully Vectorized)
+void Ped::Model::tickVECTOR() {
+    // Process 8 agents at a time using AVX2
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < agentData.paddedCount; i += AGENTS_PER_VECTOR) {
+        // Load positions and destinations
+        __m256 posX = _mm256_load_ps(&agentData.x[i]);
+        __m256 posY = _mm256_load_ps(&agentData.y[i]);
+        __m256 destX = _mm256_load_ps(&agentData.destX[i]);
+        __m256 destY = _mm256_load_ps(&agentData.destY[i]);
+        __m256 destR = _mm256_load_ps(&agentData.destR[i]);
+        
+        // Calculate direction vectors
+        __m256 diffX = _mm256_sub_ps(destX, posX);
+        __m256 diffY = _mm256_sub_ps(destY, posY);
+        
+        // Calculate squared distance
+        __m256 dx2 = _mm256_mul_ps(diffX, diffX);
+        __m256 dy2 = _mm256_mul_ps(diffY, diffY);
+        __m256 distSq = _mm256_add_ps(dx2, dy2);
+        
+        // Calculate normalized movement (avoid division by zero)
+        __m256 mask = _mm256_cmp_ps(distSq, _mm256_set1_ps(1e-10f), _CMP_GT_OQ);
+        __m256 invDist = _mm256_rsqrt_ps(distSq);
+        invDist = _mm256_and_ps(invDist, mask);
+        
+        // Update positions
+        __m256 stepX = _mm256_mul_ps(diffX, invDist);
+        __m256 stepY = _mm256_mul_ps(diffY, invDist);
+        posX = _mm256_add_ps(posX, stepX);
+        posY = _mm256_add_ps(posY, stepY);
+        
+        // Store updated positions
+        _mm256_store_ps(&agentData.x[i], posX);
+        _mm256_store_ps(&agentData.y[i], posY);
+        
+        // Check if destinations reached (vectorized)
+        __m256 newDiffX = _mm256_sub_ps(destX, posX);
+        __m256 newDiffY = _mm256_sub_ps(destY, posY);
+        __m256 newDx2 = _mm256_mul_ps(newDiffX, newDiffX);
+        __m256 newDy2 = _mm256_mul_ps(newDiffY, newDiffY);
+        __m256 newDistSq = _mm256_add_ps(newDx2, newDy2);
+        __m256 radiusSq = _mm256_mul_ps(destR, destR);
+        
+        __m256 reachedMask = _mm256_cmp_ps(newDistSq, radiusSq, _CMP_LT_OQ);
+        int maskBits = _mm256_movemask_ps(reachedMask);
+        
+        // Update waypoints for agents that reached destination
+        if (maskBits != 0) {
+            for (int j = 0; j < AGENTS_PER_VECTOR && (i + j) < agentData.count; ++j) {
+                if (maskBits & (1 << j)) {
+                    int agentIdx = i + j;
+                    if (agentData.wpCount[agentIdx] > 0) {
+                        agentData.wpIndex[agentIdx] = (agentData.wpIndex[agentIdx] + 1) % agentData.wpCount[agentIdx];
+                        int poolIdx = agentData.wpOffset[agentIdx] + agentData.wpIndex[agentIdx];
+                        agentData.destX[agentIdx] = agentData.wpPoolX[poolIdx];
+                        agentData.destY[agentIdx] = agentData.wpPoolY[poolIdx];
+                        agentData.destR[agentIdx] = agentData.wpPoolR[poolIdx];
+                    }
+                }
+            }
+        }
+    }
+}
+
+#ifdef USE_CUDA
+void Ped::Model::setupCUDA() {
+    cudaStreamCreate(&cudaData.stream);
+    cudaData.dataValid = false;
+    
+    size_t floatSize = agentData.paddedCount * sizeof(float);
+    size_t intSize = agentData.paddedCount * sizeof(int);
+    size_t wpPoolSize = agentData.wpPoolSize * sizeof(float);
+    
+    // Allocate device memory
+    cudaMalloc(&cudaData.d_x, floatSize);
+    cudaMalloc(&cudaData.d_y, floatSize);
+    cudaMalloc(&cudaData.d_destX, floatSize);
+    cudaMalloc(&cudaData.d_destY, floatSize);
+    cudaMalloc(&cudaData.d_destR, floatSize);
+    cudaMalloc(&cudaData.d_wpIndex, intSize);
+    cudaMalloc(&cudaData.d_wpCount, intSize);
+    cudaMalloc(&cudaData.d_wpOffset, intSize);
+    cudaMalloc(&cudaData.d_wpPoolX, wpPoolSize);
+    cudaMalloc(&cudaData.d_wpPoolY, wpPoolSize);
+    cudaMalloc(&cudaData.d_wpPoolR, wpPoolSize);
+    
+    // Copy static data to GPU
+    cudaMemcpyAsync(cudaData.d_wpPoolX, agentData.wpPoolX, wpPoolSize, 
+                    cudaMemcpyHostToDevice, cudaData.stream);
+    cudaMemcpyAsync(cudaData.d_wpPoolY, agentData.wpPoolY, wpPoolSize, 
+                    cudaMemcpyHostToDevice, cudaData.stream);
+    cudaMemcpyAsync(cudaData.d_wpPoolR, agentData.wpPoolR, wpPoolSize, 
+                    cudaMemcpyHostToDevice, cudaData.stream);
+    cudaMemcpyAsync(cudaData.d_wpCount, agentData.wpCount, intSize, 
+                    cudaMemcpyHostToDevice, cudaData.stream);
+    cudaMemcpyAsync(cudaData.d_wpOffset, agentData.wpOffset, intSize, 
+                    cudaMemcpyHostToDevice, cudaData.stream);
+    
+    // cudaStreamSynchronize(cudaData.stream);
+}
+
+void Ped::Model::tickCUDA() {
+    #ifdef USE_CUDA
+    size_t fSize = agentData.paddedCount * sizeof(float);
+    size_t iSize = agentData.paddedCount * sizeof(int);
+    
+    // 1. Copy dynamic data TO GPU (Slide 42: HostToDevice)
+    // We only copy what is needed for the math
+    cudaMemcpyAsync(cudaData.d_x, agentData.x, fSize, cudaMemcpyHostToDevice, cudaData.stream);
+    cudaMemcpyAsync(cudaData.d_y, agentData.y, fSize, cudaMemcpyHostToDevice, cudaData.stream);
+    cudaMemcpyAsync(cudaData.d_destX, agentData.destX, fSize, cudaMemcpyHostToDevice, cudaData.stream);
+    cudaMemcpyAsync(cudaData.d_destY, agentData.destY, fSize, cudaMemcpyHostToDevice, cudaData.stream);
+    cudaMemcpyAsync(cudaData.d_destR, agentData.destR, fSize, cudaMemcpyHostToDevice, cudaData.stream);
+    cudaMemcpyAsync(cudaData.d_wpIndex, agentData.wpIndex, iSize, cudaMemcpyHostToDevice, cudaData.stream);
+
+    // 2. Launch Kernel (Slide 42)
+    cudaKernelfunction(
+        cudaData.d_x, cudaData.d_y, cudaData.d_destX, cudaData.d_destY, cudaData.d_destR,
+        cudaData.d_wpIndex, cudaData.d_wpCount, cudaData.d_wpOffset,
+        cudaData.d_wpPoolX, cudaData.d_wpPoolY, cudaData.d_wpPoolR,
+        agentData.count, cudaData.stream);
+    
+    // 3. Copy results BACK to CPU (Slide 42: DeviceToHost)
+    // We need the new X/Y for the GUI and the new wpIndex to know where agents are
+    cudaMemcpyAsync(agentData.x, cudaData.d_x, fSize, cudaMemcpyDeviceToHost, cudaData.stream);
+    cudaMemcpyAsync(agentData.y, cudaData.d_y, fSize, cudaMemcpyDeviceToHost, cudaData.stream);
+    cudaMemcpyAsync(agentData.destX, cudaData.d_destX, fSize, cudaMemcpyDeviceToHost, cudaData.stream);
+    cudaMemcpyAsync(agentData.destY, cudaData.d_destY, fSize, cudaMemcpyDeviceToHost, cudaData.stream);
+    cudaMemcpyAsync(agentData.destR, cudaData.d_destR, fSize, cudaMemcpyDeviceToHost, cudaData.stream);
+    cudaMemcpyAsync(agentData.wpIndex, cudaData.d_wpIndex, iSize, cudaMemcpyDeviceToHost, cudaData.stream);
+    
+    // 4. Synchronize the stream before the tick ends
+    cudaStreamSynchronize(cudaData.stream);
+    #endif
+}
+
+void Ped::Model::cleanupCUDA() {
+    static bool cudaCleaned = false;
+    if (cudaCleaned) return;
+    cudaCleaned = true;
+    
+    if (implementation == CUDA) {
+        if(cudaData.stream) cudaStreamDestroy(cudaData.stream); cudaData.stream = nullptr;
+        if(cudaData.d_x) cudaFree(cudaData.d_x); cudaData.d_x = nullptr;
+        if(cudaData.d_y) cudaFree(cudaData.d_y); cudaData.d_y = nullptr;
+        if(cudaData.d_destX) cudaFree(cudaData.d_destX); cudaData.d_destX = nullptr;
+        if(cudaData.d_destY) cudaFree(cudaData.d_destY); cudaData.d_destY = nullptr;
+        if(cudaData.d_destR) cudaFree(cudaData.d_destR); cudaData.d_destR = nullptr;
+        if(cudaData.d_wpIndex) cudaFree(cudaData.d_wpIndex); cudaData.d_wpIndex = nullptr;
+        if(cudaData.d_wpCount) cudaFree(cudaData.d_wpCount); cudaData.d_wpCount = nullptr;
+        if(cudaData.d_wpOffset) cudaFree(cudaData.d_wpOffset); cudaData.d_wpOffset = nullptr;
+        if(cudaData.d_wpPoolX) cudaFree(cudaData.d_wpPoolX); cudaData.d_wpPoolX = nullptr;
+        if(cudaData.d_wpPoolY) cudaFree(cudaData.d_wpPoolY); cudaData.d_wpPoolY = nullptr;
+        if(cudaData.d_wpPoolR) cudaFree(cudaData.d_wpPoolR); cudaData.d_wpPoolR = nullptr;
+    }
+}
+#endif
+
+
 
 ////////////
 /// Everything below here relevant for Assignment 3.
@@ -412,7 +429,7 @@ void Ped::Model::tick()
 void Ped::Model::move(Ped::Tagent *agent)
 {
 	// Search for neighboring agents
-	set<const Ped::Tagent *> neighbors = getNeighbors(agent->getX(), agent->getY(), 2);
+	std::set<const Ped::Tagent *> neighbors = getNeighbors(agent->getX(), agent->getY(), 2);
 
 	// Retrieve their positions
 	std::vector<std::pair<int, int>> takenPositions;
@@ -447,17 +464,14 @@ void Ped::Model::move(Ped::Tagent *agent)
 	prioritizedAlternatives.push_back(p2);
 
 	// Find the first empty alternative position
-	for (std::vector<pair<int, int>>::iterator it = prioritizedAlternatives.begin(); it != prioritizedAlternatives.end(); ++it)
+	for (std::vector<std::pair<int, int>>::iterator it = prioritizedAlternatives.begin(); it != prioritizedAlternatives.end(); ++it)
 	{
-
 		// If the current position is not yet taken by any neighbor
 		if (std::find(takenPositions.begin(), takenPositions.end(), *it) == takenPositions.end())
 		{
-
 			// Set the agent's position
 			agent->setX((*it).first);
 			agent->setY((*it).second);
-
 			break;
 		}
 	}
@@ -470,37 +484,51 @@ void Ped::Model::move(Ped::Tagent *agent)
 /// \param   x the x coordinate
 /// \param   y the y coordinate
 /// \param   dist the distance around x/y that will be searched for agents (search field is a square in the current implementation)
-set<const Ped::Tagent *> Ped::Model::getNeighbors(int x, int y, int dist) const
+std::set<const Ped::Tagent *> Ped::Model::getNeighbors(int x, int y, int dist) const
 {
-
 	// create the output list
 	// ( It would be better to include only the agents close by, but this programmer is lazy.)
-	return set<const Ped::Tagent *>(agents.begin(), agents.end());
+	return std::set<const Ped::Tagent *>(agents.begin(), agents.end());
 }
 
-void Ped::Model::cleanup()
-{
-	// Nothing to do here right now.
-	if (agentX) _mm_free(agentX);
-    if (agentY) _mm_free(agentY);
-    if (destX)  _mm_free(destX);
-    if (destY)  _mm_free(destY);
-    if (destR)  _mm_free(destR);
-
-	if (d_agentX) cudaFree(d_agentX);
-    if (d_agentY) cudaFree(d_agentY);
-    if (d_destX)  cudaFree(d_destX);
-    if (d_destY)  cudaFree(d_destY);
-	if (d_destR)  cudaFree(d_destR);
-
+void Ped::Model::cleanup() {
+    if (isCleaned) return;
+    isCleaned = true;
+    
+    std::cout << "Starting cleanup..." << std::endl;
+    
+    // Free pinned memory allocated with cudaMallocHost
+    if (agentData.x)        { cudaFreeHost(agentData.x);        agentData.x = nullptr; }
+    if (agentData.y)        { cudaFreeHost(agentData.y);        agentData.y = nullptr; }
+    if (agentData.destX)    { cudaFreeHost(agentData.destX);    agentData.destX = nullptr; }
+    if (agentData.destY)    { cudaFreeHost(agentData.destY);    agentData.destY = nullptr; }
+    if (agentData.destR)    { cudaFreeHost(agentData.destR);    agentData.destR = nullptr; }
+    if (agentData.wpIndex)  { cudaFreeHost(agentData.wpIndex);  agentData.wpIndex = nullptr; }
+    if (agentData.wpCount)  { cudaFreeHost(agentData.wpCount);  agentData.wpCount = nullptr; }
+    if (agentData.wpOffset) { cudaFreeHost(agentData.wpOffset); agentData.wpOffset = nullptr; }
+    if (agentData.wpPoolX)  { cudaFreeHost(agentData.wpPoolX);  agentData.wpPoolX = nullptr; }
+    if (agentData.wpPoolY)  { cudaFreeHost(agentData.wpPoolY);  agentData.wpPoolY = nullptr; }
+    if (agentData.wpPoolR)  { cudaFreeHost(agentData.wpPoolR);  agentData.wpPoolR = nullptr; }
+    
+    std::cout << "Freed all agentData arrays" << std::endl;
+    
+    #ifdef USE_CUDA
+    if (implementation == CUDA) cleanupCUDA();
+    std::cout << "CUDA cleanup done" << std::endl;
+    #endif
 }
 
-Ped::Model::~Model()
-{
-	cleanup();
+// THE MISSING LINK: The actual implementation of the destructor
+Ped::Model::~Model() {
+    std::cout << "Model destructor called" << std::endl;
+    
+    // Detach agents so they don't try to access deleted arrays
+    for(auto* agent : agents) {
+        if(agent) agent->setId(-1, nullptr); 
+    }
 
-	std::for_each(agents.begin(), agents.end(), [](Ped::Tagent *agent)
-				  { delete agent; });
-	std::for_each(destinations.begin(), destinations.end(), [](Ped::Twaypoint *destination)
-				  { delete destination; });
+    cleanup();
+    std::cout << "Model destructor finished" << std::endl;
+    // DO NOT delete agents or destinations
 }
+
