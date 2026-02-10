@@ -18,7 +18,7 @@
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
-// Declare CUDA kernel function instead of including header
+// Declare CUDA kernel function
 extern "C" void cudaKernelfunction(float* d_x, float* d_y, 
                                    float* d_destX, float* d_destY, float* d_destR,
                                    int* d_wpIndex, const int* d_wpCount, const int* d_wpOffset,
@@ -67,15 +67,15 @@ void Ped::Model::allocateArrays() {
     agentData.count = agents.size();
     agentData.paddedCount = ((agentData.count + AGENTS_PER_VECTOR - 1) / AGENTS_PER_VECTOR) * AGENTS_PER_VECTOR;
     
-    // Use cudaMallocHost for ALL arrays - it's pinned and aligned
-    cudaMallocHost(&agentData.x, agentData.paddedCount * sizeof(float));
-    cudaMallocHost(&agentData.y, agentData.paddedCount * sizeof(float));
-    cudaMallocHost(&agentData.destX, agentData.paddedCount * sizeof(float));
-    cudaMallocHost(&agentData.destY, agentData.paddedCount * sizeof(float));
-    cudaMallocHost(&agentData.destR, agentData.paddedCount * sizeof(float));
-    cudaMallocHost(&agentData.wpIndex, agentData.paddedCount * sizeof(int));
-    cudaMallocHost(&agentData.wpCount, agentData.paddedCount * sizeof(int));
-    cudaMallocHost(&agentData.wpOffset, agentData.paddedCount * sizeof(int));
+    // Allocate aligned arrays
+    agentData.x = aligned_alloc<float>(agentData.paddedCount);
+    agentData.y = aligned_alloc<float>(agentData.paddedCount);
+    agentData.destX = aligned_alloc<float>(agentData.paddedCount);
+    agentData.destY = aligned_alloc<float>(agentData.paddedCount);
+    agentData.destR = aligned_alloc<float>(agentData.paddedCount);
+    agentData.wpIndex = aligned_alloc<int>(agentData.paddedCount);
+    agentData.wpCount = aligned_alloc<int>(agentData.paddedCount);
+    agentData.wpOffset = aligned_alloc<int>(agentData.paddedCount);
     
     // Initialize all pointers to nullptr
     agentData.wpPoolX = nullptr;
@@ -92,10 +92,10 @@ void Ped::Model::buildWaypointPool() {
     
     agentData.wpPoolSize = totalWaypoints;
     
-    // Use cudaMallocHost for consistency
-    cudaMallocHost(&agentData.wpPoolX, totalWaypoints * sizeof(float));
-    cudaMallocHost(&agentData.wpPoolY, totalWaypoints * sizeof(float));
-    cudaMallocHost(&agentData.wpPoolR, totalWaypoints * sizeof(float));
+    // Allocate waypoint pool
+    agentData.wpPoolX = aligned_alloc<float>(totalWaypoints);
+    agentData.wpPoolY = aligned_alloc<float>(totalWaypoints);
+    agentData.wpPoolR = aligned_alloc<float>(totalWaypoints);
     
     // Fill waypoint pool
     int offset = 0;
@@ -326,7 +326,6 @@ void Ped::Model::tickVECTOR() {
 #ifdef USE_CUDA
 void Ped::Model::setupCUDA() {
     cudaStreamCreate(&cudaData.stream);
-    cudaData.dataValid = false;
     
     size_t floatSize = agentData.paddedCount * sizeof(float);
     size_t intSize = agentData.paddedCount * sizeof(int);
@@ -345,52 +344,39 @@ void Ped::Model::setupCUDA() {
     cudaMalloc(&cudaData.d_wpPoolY, wpPoolSize);
     cudaMalloc(&cudaData.d_wpPoolR, wpPoolSize);
     
-    // Copy static data to GPU
-    cudaMemcpyAsync(cudaData.d_wpPoolX, agentData.wpPoolX, wpPoolSize, 
-                    cudaMemcpyHostToDevice, cudaData.stream);
-    cudaMemcpyAsync(cudaData.d_wpPoolY, agentData.wpPoolY, wpPoolSize, 
-                    cudaMemcpyHostToDevice, cudaData.stream);
-    cudaMemcpyAsync(cudaData.d_wpPoolR, agentData.wpPoolR, wpPoolSize, 
-                    cudaMemcpyHostToDevice, cudaData.stream);
-    cudaMemcpyAsync(cudaData.d_wpCount, agentData.wpCount, intSize, 
-                    cudaMemcpyHostToDevice, cudaData.stream);
-    cudaMemcpyAsync(cudaData.d_wpOffset, agentData.wpOffset, intSize, 
-                    cudaMemcpyHostToDevice, cudaData.stream);
+    // Copy ALL data to GPU once (including initial positions)
+    cudaMemcpy(cudaData.d_x, agentData.x, floatSize, cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaData.d_y, agentData.y, floatSize, cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaData.d_destX, agentData.destX, floatSize, cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaData.d_destY, agentData.destY, floatSize, cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaData.d_destR, agentData.destR, floatSize, cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaData.d_wpIndex, agentData.wpIndex, intSize, cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaData.d_wpCount, agentData.wpCount, intSize, cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaData.d_wpOffset, agentData.wpOffset, intSize, cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaData.d_wpPoolX, agentData.wpPoolX, wpPoolSize, cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaData.d_wpPoolY, agentData.wpPoolY, wpPoolSize, cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaData.d_wpPoolR, agentData.wpPoolR, wpPoolSize, cudaMemcpyHostToDevice);
     
-    // cudaStreamSynchronize(cudaData.stream);
+    cudaDeviceSynchronize();
 }
 
 void Ped::Model::tickCUDA() {
     #ifdef USE_CUDA
-    size_t fSize = agentData.paddedCount * sizeof(float);
-    size_t iSize = agentData.paddedCount * sizeof(int);
+    // NO COPIES TO GPU - data already there!
     
-    // 1. Copy dynamic data TO GPU (Slide 42: HostToDevice)
-    // We only copy what is needed for the math
-    cudaMemcpyAsync(cudaData.d_x, agentData.x, fSize, cudaMemcpyHostToDevice, cudaData.stream);
-    cudaMemcpyAsync(cudaData.d_y, agentData.y, fSize, cudaMemcpyHostToDevice, cudaData.stream);
-    cudaMemcpyAsync(cudaData.d_destX, agentData.destX, fSize, cudaMemcpyHostToDevice, cudaData.stream);
-    cudaMemcpyAsync(cudaData.d_destY, agentData.destY, fSize, cudaMemcpyHostToDevice, cudaData.stream);
-    cudaMemcpyAsync(cudaData.d_destR, agentData.destR, fSize, cudaMemcpyHostToDevice, cudaData.stream);
-    cudaMemcpyAsync(cudaData.d_wpIndex, agentData.wpIndex, iSize, cudaMemcpyHostToDevice, cudaData.stream);
-
-    // 2. Launch Kernel (Slide 42)
+    // Launch kernel
     cudaKernelfunction(
-        cudaData.d_x, cudaData.d_y, cudaData.d_destX, cudaData.d_destY, cudaData.d_destR,
+        cudaData.d_x, cudaData.d_y, 
+        cudaData.d_destX, cudaData.d_destY, cudaData.d_destR,
         cudaData.d_wpIndex, cudaData.d_wpCount, cudaData.d_wpOffset,
         cudaData.d_wpPoolX, cudaData.d_wpPoolY, cudaData.d_wpPoolR,
         agentData.count, cudaData.stream);
     
-    // 3. Copy results BACK to CPU (Slide 42: DeviceToHost)
-    // We need the new X/Y for the GUI and the new wpIndex to know where agents are
+    // ONLY copy positions back (minimal data)
+    size_t fSize = agentData.count * sizeof(float); // Use count, not paddedCount
     cudaMemcpyAsync(agentData.x, cudaData.d_x, fSize, cudaMemcpyDeviceToHost, cudaData.stream);
     cudaMemcpyAsync(agentData.y, cudaData.d_y, fSize, cudaMemcpyDeviceToHost, cudaData.stream);
-    cudaMemcpyAsync(agentData.destX, cudaData.d_destX, fSize, cudaMemcpyDeviceToHost, cudaData.stream);
-    cudaMemcpyAsync(agentData.destY, cudaData.d_destY, fSize, cudaMemcpyDeviceToHost, cudaData.stream);
-    cudaMemcpyAsync(agentData.destR, cudaData.d_destR, fSize, cudaMemcpyDeviceToHost, cudaData.stream);
-    cudaMemcpyAsync(agentData.wpIndex, cudaData.d_wpIndex, iSize, cudaMemcpyDeviceToHost, cudaData.stream);
     
-    // 4. Synchronize the stream before the tick ends
     cudaStreamSynchronize(cudaData.stream);
     #endif
 }
@@ -497,18 +483,18 @@ void Ped::Model::cleanup() {
     
     std::cout << "Starting cleanup..." << std::endl;
     
-    // Free pinned memory allocated with cudaMallocHost
-    if (agentData.x)        { cudaFreeHost(agentData.x);        agentData.x = nullptr; }
-    if (agentData.y)        { cudaFreeHost(agentData.y);        agentData.y = nullptr; }
-    if (agentData.destX)    { cudaFreeHost(agentData.destX);    agentData.destX = nullptr; }
-    if (agentData.destY)    { cudaFreeHost(agentData.destY);    agentData.destY = nullptr; }
-    if (agentData.destR)    { cudaFreeHost(agentData.destR);    agentData.destR = nullptr; }
-    if (agentData.wpIndex)  { cudaFreeHost(agentData.wpIndex);  agentData.wpIndex = nullptr; }
-    if (agentData.wpCount)  { cudaFreeHost(agentData.wpCount);  agentData.wpCount = nullptr; }
-    if (agentData.wpOffset) { cudaFreeHost(agentData.wpOffset); agentData.wpOffset = nullptr; }
-    if (agentData.wpPoolX)  { cudaFreeHost(agentData.wpPoolX);  agentData.wpPoolX = nullptr; }
-    if (agentData.wpPoolY)  { cudaFreeHost(agentData.wpPoolY);  agentData.wpPoolY = nullptr; }
-    if (agentData.wpPoolR)  { cudaFreeHost(agentData.wpPoolR);  agentData.wpPoolR = nullptr; }
+    // Free aligned memory
+    if (agentData.x)        { _mm_free(agentData.x);        agentData.x = nullptr; }
+    if (agentData.y)        { _mm_free(agentData.y);        agentData.y = nullptr; }
+    if (agentData.destX)    { _mm_free(agentData.destX);    agentData.destX = nullptr; }
+    if (agentData.destY)    { _mm_free(agentData.destY);    agentData.destY = nullptr; }
+    if (agentData.destR)    { _mm_free(agentData.destR);    agentData.destR = nullptr; }
+    if (agentData.wpIndex)  { _mm_free(agentData.wpIndex);  agentData.wpIndex = nullptr; }
+    if (agentData.wpCount)  { _mm_free(agentData.wpCount);  agentData.wpCount = nullptr; }
+    if (agentData.wpOffset) { _mm_free(agentData.wpOffset); agentData.wpOffset = nullptr; }
+    if (agentData.wpPoolX)  { _mm_free(agentData.wpPoolX);  agentData.wpPoolX = nullptr; }
+    if (agentData.wpPoolY)  { _mm_free(agentData.wpPoolY);  agentData.wpPoolY = nullptr; }
+    if (agentData.wpPoolR)  { _mm_free(agentData.wpPoolR);  agentData.wpPoolR = nullptr; }
     
     std::cout << "Freed all agentData arrays" << std::endl;
     
@@ -531,4 +517,3 @@ Ped::Model::~Model() {
     std::cout << "Model destructor finished" << std::endl;
     // DO NOT delete agents or destinations
 }
-

@@ -27,15 +27,15 @@ void Ped::Tagent::init(int posX, int posY) {
 
 int Ped::Tagent::getX() const {
     if (model && id >= 0) {
-        // Direct array access - no sync needed!
-        return (int)model->agentData.x[id];
+        // Use model's agentData arrays via the agent's ID
+        return (int)roundf(model->agentData.x[id]);
     }
     return init_x;  // Fallback during setup
 }
 
 int Ped::Tagent::getY() const {
     if (model && id >= 0) {
-        return (int)model->agentData.y[id];
+        return (int)roundf(model->agentData.y[id]);
     }
     return init_y;
 }

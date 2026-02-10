@@ -59,8 +59,14 @@ namespace Ped {
         void cleanup();
         ~Model();
 
-        // Public data for direct access
+        // Public data for direct access - agents access this via their ID
         AgentArrays agentData;
+
+        // Accessor methods for agents to use
+        float getAgentX(int id) const { return agentData.x[id]; }
+        float getAgentY(int id) const { return agentData.y[id]; }
+        void setAgentX(int id, float value) { agentData.x[id] = value; }
+        void setAgentY(int id, float value) { agentData.y[id] = value; }
 
 		int const * const * getHeatmap() const { return blurred_heatmap; };
 		int getHeatmapSize() const;
