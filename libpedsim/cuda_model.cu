@@ -73,10 +73,12 @@ extern "C" void cudaKernelfunction(float* d_x, float* d_y,
                                    const float* d_wpPoolX, const float* d_wpPoolY, const float* d_wpPoolR,
                                    int numAgents, cudaStream_t stream) 
 {
-    int threadsPerBlock = 128; // Using 128 threads because each thread handles 8 agents (Total 1024)
-    int blocksPerGrid = (numAgents + (threadsPerBlock * 8) - 1) / (threadsPerBlock * 8);
+    // Each thread handles 8 agents
+    int threadsPerBlock = 256;
+    int agentsPerBlock = threadsPerBlock * 8;
+    int blocks = (numAgents + agentsPerBlock - 1) / agentsPerBlock;
     
-    cudaMoveKernel<<<blocksPerGrid, threadsPerBlock, 0, stream>>>(
+    cudaMoveKernel<<<blocks, threadsPerBlock, 0, stream>>>(
         d_x, d_y, d_destX, d_destY, d_destR,
         d_wpIndex, d_wpCount, d_wpOffset,
         d_wpPoolX, d_wpPoolY, d_wpPoolR,
