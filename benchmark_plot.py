@@ -6,9 +6,10 @@ import numpy as np
 
 # Configuration
 SCENARIOS = ["hugeScenario.xml", "scenario_box.xml", "scenario.xml", "insaneScenario.xml"]
+# SCENARIOS = ["scenario.xml"]
 EXECUTABLE = "./demo/demo"
 MAX_THREADS = 16
-RUNS = 1 # Set to 3-5 for final submission to get smooth lines
+RUNS = 1# Set to 3-5 for final submission to get smooth lines
 
 def run_and_get_time(flag, threads, current_scenario):
     env = os.environ.copy()
@@ -144,7 +145,7 @@ for scenario_file in SCENARIOS:
     colors = ['#808080', '#ff9900', '#2ca02c', '#9467bd', '#1f77b4']
     bars = plt.bar(labels, plot_times, color=colors)
     plt.ylabel("Execution Time (ms)")
-    plt.title(f"3.6 Evaluation: Best Execution Times\nScenario: {scenario_file}")
+    plt.title(f"Best Execution Times\nScenario: {scenario_file}")
 
     for bar in bars:
         yval = bar.get_height()

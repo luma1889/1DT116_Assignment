@@ -192,35 +192,33 @@ void Ped::Model::tickSEQ()
 {
     for (int i = 0; i < agentData.count; ++i)
     {
+        // Check if reached current destination
         float dx = agentData.destX[i] - agentData.x[i];
         float dy = agentData.destY[i] - agentData.y[i];
-        float distSq = fmaf(dx, dx, dy * dy); // FMA
-
-        if (distSq > 1e-10f)
-        {
-            float invDist = 1.0f / sqrtf(distSq);
-            agentData.x[i] = fmaf(dx, invDist, agentData.x[i]); // FMA
-            agentData.y[i] = fmaf(dy, invDist, agentData.y[i]); // FMA
+        float distSq = dx * dx + dy * dy;
+        float radiusSq = agentData.destR[i] * agentData.destR[i];
+        
+        // Update waypoint if reached
+        if (distSq < radiusSq && agentData.wpCount[i] > 0) {
+            int next = agentData.wpIndex[i] + 1;
+            if (next >= agentData.wpCount[i]) next = 0;
+            agentData.wpIndex[i] = next;
+            
+            int poolIdx = agentData.wpOffset[i] + next;
+            agentData.destX[i] = agentData.wpPoolX[poolIdx];
+            agentData.destY[i] = agentData.wpPoolY[poolIdx];
+            agentData.destR[i] = agentData.wpPoolR[poolIdx];
         }
-
+        
+        // Move toward current destination (1 unit step)
         dx = agentData.destX[i] - agentData.x[i];
         dy = agentData.destY[i] - agentData.y[i];
-        float newDistSq = fmaf(dx, dx, dy * dy); // FMA
-
-        if (newDistSq < (agentData.destR[i] * agentData.destR[i]))
-        {
-            if (agentData.wpCount[i] > 0)
-            {
-                int next = agentData.wpIndex[i] + 1;
-                if (next >= agentData.wpCount[i])
-                    next = 0; // Faster than modulo
-                agentData.wpIndex[i] = next;
-
-                int poolIdx = agentData.wpOffset[i] + next;
-                agentData.destX[i] = agentData.wpPoolX[poolIdx];
-                agentData.destY[i] = agentData.wpPoolY[poolIdx];
-                agentData.destR[i] = agentData.wpPoolR[poolIdx];
-            }
+        float length = sqrtf(dx * dx + dy * dy);
+        
+        if (length > 1e-6f) {
+            float invLength = 1.0f / length;
+            agentData.x[i] += dx * invLength;
+            agentData.y[i] += dy * invLength;
         }
     }
 }
@@ -228,38 +226,34 @@ void Ped::Model::tickSEQ()
 // Optimized OpenMP implementation
 void Ped::Model::tickOMP()
 {
-#pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < agentData.count; ++i)
     {
         float dx = agentData.destX[i] - agentData.x[i];
         float dy = agentData.destY[i] - agentData.y[i];
-        float distSq = fmaf(dx, dx, dy * dy);
-
-        if (distSq > 1e-10f)
-        {
-            float invDist = 1.0f / sqrtf(distSq);
-            agentData.x[i] = fmaf(dx, invDist, agentData.x[i]);
-            agentData.y[i] = fmaf(dy, invDist, agentData.y[i]);
-        }
-
-        dx = agentData.destX[i] - agentData.x[i];
-        dy = agentData.destY[i] - agentData.y[i];
-        float newDistSq = fmaf(dx, dx, dy * dy);
-
-        if (newDistSq < (agentData.destR[i] * agentData.destR[i]))
-        {
-            if (agentData.wpCount[i] > 0)
-            {
+        float distSq = dx * dx + dy * dy;
+        
+        if (distSq < agentData.destR[i] * agentData.destR[i]) {
+            if (agentData.wpCount[i] > 0) {
                 int next = agentData.wpIndex[i] + 1;
-                if (next >= agentData.wpCount[i])
-                    next = 0;
+                if (next >= agentData.wpCount[i]) next = 0;
                 agentData.wpIndex[i] = next;
-
+                
                 int poolIdx = agentData.wpOffset[i] + next;
                 agentData.destX[i] = agentData.wpPoolX[poolIdx];
                 agentData.destY[i] = agentData.wpPoolY[poolIdx];
                 agentData.destR[i] = agentData.wpPoolR[poolIdx];
+                
+                dx = agentData.destX[i] - agentData.x[i];
+                dy = agentData.destY[i] - agentData.y[i];
             }
+        }
+        
+        float distSqNew = dx * dx + dy * dy;
+        if (distSqNew > 1e-10f) {
+            float invDist = 1.0f / sqrtf(distSqNew);
+            agentData.x[i] += dx * invDist;
+            agentData.y[i] += dy * invDist;
         }
     }
 }
@@ -277,33 +271,29 @@ void Ped::Model::tickPTHREAD()
         {
             float dx = agentData.destX[i] - agentData.x[i];
             float dy = agentData.destY[i] - agentData.y[i];
-            float distSq = fmaf(dx, dx, dy * dy);
-
-            if (distSq > 1e-10f)
-            {
-                float invDist = 1.0f / sqrtf(distSq);
-                agentData.x[i] = fmaf(dx, invDist, agentData.x[i]);
-                agentData.y[i] = fmaf(dy, invDist, agentData.y[i]);
-            }
-
-            dx = agentData.destX[i] - agentData.x[i];
-            dy = agentData.destY[i] - agentData.y[i];
-            float newDistSq = fmaf(dx, dx, dy * dy);
-
-            if (newDistSq < (agentData.destR[i] * agentData.destR[i]))
-            {
-                if (agentData.wpCount[i] > 0)
-                {
+            float distSq = dx * dx + dy * dy;
+            
+            if (distSq < agentData.destR[i] * agentData.destR[i]) {
+                if (agentData.wpCount[i] > 0) {
                     int next = agentData.wpIndex[i] + 1;
-                    if (next >= agentData.wpCount[i])
-                        next = 0;
+                    if (next >= agentData.wpCount[i]) next = 0;
                     agentData.wpIndex[i] = next;
-
+                    
                     int poolIdx = agentData.wpOffset[i] + next;
                     agentData.destX[i] = agentData.wpPoolX[poolIdx];
                     agentData.destY[i] = agentData.wpPoolY[poolIdx];
                     agentData.destR[i] = agentData.wpPoolR[poolIdx];
+                    
+                    dx = agentData.destX[i] - agentData.x[i];
+                    dy = agentData.destY[i] - agentData.y[i];
                 }
+            }
+            
+            float distSqNew = dx * dx + dy * dy;
+            if (distSqNew > 1e-10f) {
+                float invDist = 1.0f / sqrtf(distSqNew);
+                agentData.x[i] += dx * invDist;
+                agentData.y[i] += dy * invDist;
             }
         }
     };
@@ -364,7 +354,7 @@ void Ped::Model::tickVECTOR()
         __m256 reachedMask = _mm256_cmp_ps(newDistSq, radiusSq, _CMP_LT_OQ);
         int maskBits = _mm256_movemask_ps(reachedMask);
 
-        // Update waypoints (scalar fallback)
+        // Update waypoints
         if (maskBits != 0)
         {
             for (int j = 0; j < AGENTS_PER_VECTOR && (i + j) < agentData.count; ++j)
@@ -431,8 +421,6 @@ void Ped::Model::setupCUDA()
 void Ped::Model::tickCUDA()
 {
 #ifdef USE_CUDA
-    // NO COPIES TO GPU - data already there!
-
     // Launch kernel
     cudaKernelfunction(
         cudaData.d_x, cudaData.d_y,
