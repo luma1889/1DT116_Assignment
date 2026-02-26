@@ -51,10 +51,28 @@ void Ped::Model::setup(std::vector<Tagent *> agentsInScenario,
         agents[i]->setId(i, this);
     }
 
+    stuckCounter.resize(agents.size(), 0);
+
     // Allocate and initialize arrays
     allocateArrays();
     buildWaypointPool();
     initializeArrays();
+
+    // Initialise the collision board
+    board = new std::atomic<int>[WORLD_WIDTH * WORLD_HEIGHT];
+    for (int i = 0; i < WORLD_WIDTH * WORLD_HEIGHT; ++i)
+        board[i].store(-1, std::memory_order_relaxed);
+
+    for (int i = 0; i < agentData.count; ++i) {
+        int x = (int)agentData.x[i];
+        int y = (int)agentData.y[i];
+        if (x >= 0 && x < WORLD_WIDTH && y >= 0 && y < WORLD_HEIGHT)
+            board[y * WORLD_WIDTH + x].store(i, std::memory_order_relaxed);
+    }
+
+    if (implementation == REGION) {
+        initRegions();
+    }
 
     // CUDA-specific setup
     if (implementation == CUDA)
@@ -81,6 +99,9 @@ void Ped::Model::allocateArrays()
     agentData.wpIndex = aligned_alloc<int>(agentData.paddedCount);
     agentData.wpCount = aligned_alloc<int>(agentData.paddedCount);
     agentData.wpOffset = aligned_alloc<int>(agentData.paddedCount);
+
+    agentData.desiredX = aligned_alloc<float>(agentData.paddedCount);
+    agentData.desiredY = aligned_alloc<float>(agentData.paddedCount);
 
     // Initialize all pointers to nullptr
     agentData.wpPoolX = nullptr;
@@ -142,6 +163,8 @@ void Ped::Model::initializeArrays()
     {
         agentData.x[i] = (float)agents[i]->getInitX();
         agentData.y[i] = (float)agents[i]->getInitY();
+        agentData.desiredX[i] = agentData.x[i];
+        agentData.desiredY[i] = agentData.y[i];
 
         // Set initial destination
         int wpIdx = agentData.wpOffset[i] + agentData.wpIndex[i];
@@ -161,6 +184,8 @@ void Ped::Model::initializeArrays()
         agentData.wpIndex[i] = 0;
         agentData.wpCount[i] = 1;
         agentData.wpOffset[i] = 0;
+        agentData.desiredX[i] = 0.0f;
+        agentData.desiredY[i] = 0.0f;
     }
 }
 
@@ -183,6 +208,9 @@ void Ped::Model::tick()
     case CUDA:
         tickCUDA();
         break;
+    case REGION:
+        tickREGION();
+        break;
     }
     // updateHeatmapSeq();
 }
@@ -190,49 +218,14 @@ void Ped::Model::tick()
 // Optimized sequential implementation
 void Ped::Model::tickSEQ()
 {
+    // Compute DESIRED positions and waypoints
     for (int i = 0; i < agentData.count; ++i)
     {
-        // Check if reached current destination
         float dx = agentData.destX[i] - agentData.x[i];
         float dy = agentData.destY[i] - agentData.y[i];
         float distSq = dx * dx + dy * dy;
-        float radiusSq = agentData.destR[i] * agentData.destR[i];
         
         // Update waypoint if reached
-        if (distSq < radiusSq && agentData.wpCount[i] > 0) {
-            int next = agentData.wpIndex[i] + 1;
-            if (next >= agentData.wpCount[i]) next = 0;
-            agentData.wpIndex[i] = next;
-            
-            int poolIdx = agentData.wpOffset[i] + next;
-            agentData.destX[i] = agentData.wpPoolX[poolIdx];
-            agentData.destY[i] = agentData.wpPoolY[poolIdx];
-            agentData.destR[i] = agentData.wpPoolR[poolIdx];
-        }
-        
-        // Move toward current destination (1 unit step)
-        dx = agentData.destX[i] - agentData.x[i];
-        dy = agentData.destY[i] - agentData.y[i];
-        float length = sqrtf(dx * dx + dy * dy);
-        
-        if (length > 1e-6f) {
-            float invLength = 1.0f / length;
-            agentData.x[i] += dx * invLength;
-            agentData.y[i] += dy * invLength;
-        }
-    }
-}
-
-// Optimized OpenMP implementation
-void Ped::Model::tickOMP()
-{
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < agentData.count; ++i)
-    {
-        float dx = agentData.destX[i] - agentData.x[i];
-        float dy = agentData.destY[i] - agentData.y[i];
-        float distSq = dx * dx + dy * dy;
-        
         if (distSq < agentData.destR[i] * agentData.destR[i]) {
             if (agentData.wpCount[i] > 0) {
                 int next = agentData.wpIndex[i] + 1;
@@ -244,17 +237,67 @@ void Ped::Model::tickOMP()
                 agentData.destY[i] = agentData.wpPoolY[poolIdx];
                 agentData.destR[i] = agentData.wpPoolR[poolIdx];
                 
+                // Recalculate dx/dy
                 dx = agentData.destX[i] - agentData.x[i];
                 dy = agentData.destY[i] - agentData.y[i];
+                distSq = dx * dx + dy * dy;
             }
         }
         
-        float distSqNew = dx * dx + dy * dy;
-        if (distSqNew > 1e-10f) {
-            float invDist = 1.0f / sqrtf(distSqNew);
-            agentData.x[i] += dx * invDist;
-            agentData.y[i] += dy * invDist;
+        // Math Vector
+        if (distSq > 1e-10f) {
+            float invDist = 1.0f / sqrtf(distSq);
+            agentData.desiredX[i] = agentData.x[i] + dx * invDist;
+            agentData.desiredY[i] = agentData.y[i] + dy * invDist;
+        } else {
+            agentData.desiredX[i] = agentData.x[i];
+            agentData.desiredY[i] = agentData.y[i];
         }
+    }
+    
+    // Move
+    for (int i = 0; i < agentData.count; ++i) {
+        move(i);
+    }
+}
+
+// Optimized OpenMP implementation
+void Ped::Model::tickOMP() 
+{
+    // MATH (Calculate where agents want to go)
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < agentData.count; ++i) {
+        float dx = agentData.destX[i] - agentData.x[i];
+        float dy = agentData.destY[i] - agentData.y[i];
+        float distSq = dx * dx + dy * dy;
+        float radSq = agentData.destR[i] * agentData.destR[i];
+        
+        // Waypoint Logic
+        if (distSq < radSq && agentData.wpCount[i] > 0) {
+            agentData.wpIndex[i] = (agentData.wpIndex[i] + 1) % agentData.wpCount[i];
+            int poolIdx = agentData.wpOffset[i] + agentData.wpIndex[i];
+            agentData.destX[i] = agentData.wpPoolX[poolIdx];
+            agentData.destY[i] = agentData.wpPoolY[poolIdx];
+            agentData.destR[i] = agentData.wpPoolR[poolIdx];
+            dx = agentData.destX[i] - agentData.x[i];
+            dy = agentData.destY[i] - agentData.y[i];
+            distSq = dx*dx + dy*dy;
+        }
+        
+        // Math Vector
+        if (distSq > 1e-10f) {
+            float invDist = 1.0f / sqrtf(distSq);
+            agentData.desiredX[i] = agentData.x[i] + dx * invDist;
+            agentData.desiredY[i] = agentData.y[i] + dy * invDist;
+        } else {
+            agentData.desiredX[i] = agentData.x[i];
+            agentData.desiredY[i] = agentData.y[i];
+        }
+    }
+    
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (int i = 0; i < agentData.count; ++i) {
+        move(i);
     }
 }
 
@@ -487,6 +530,372 @@ void Ped::Model::cleanupCUDA()
 }
 #endif
 
+
+// Region setup
+void Ped::Model::initRegions()
+{
+    regions.clear();
+
+    // Start with a 2×2 grid → 4 regions
+    int midX = WORLD_WIDTH  / 2;   // 80
+    int midY = WORLD_HEIGHT / 2;   // 60
+
+    regions.push_back({0,    midX, 0,    midY});   // top-left
+    regions.push_back({midX, WORLD_WIDTH,  0,    midY});   // top-right
+    regions.push_back({0,    midX, midY, WORLD_HEIGHT}); // bottom-left
+    regions.push_back({midX, WORLD_WIDTH,  midY, WORLD_HEIGHT}); // bottom-right
+
+    rebuildBorderMap();
+    assignAgentsToRegions();
+}
+
+// Border map logic
+// Mark every cell that is within BORDER_WIDTH of any inter-region boundary.
+// Calls to this must happen after regions change.
+
+void Ped::Model::rebuildBorderMap()
+{
+    std::fill(borderCellMap, borderCellMap + WORLD_WIDTH * WORLD_HEIGHT, false);
+
+    for (const auto &r : regions) {
+        // Left and right border strips of this region
+        for (int y = r.minY; y < r.maxY; ++y) {
+            for (int bw = 0; bw < BORDER_WIDTH; ++bw) {
+                int xl = r.minX + bw;
+                int xr = r.maxX - 1 - bw;
+                if (xl < WORLD_WIDTH)  borderCellMap[y * WORLD_WIDTH + xl] = true;
+                if (xr >= 0)           borderCellMap[y * WORLD_WIDTH + xr] = true;
+            }
+        }
+        // Top and bottom border strips
+        for (int x = r.minX; x < r.maxX; ++x) {
+            for (int bw = 0; bw < BORDER_WIDTH; ++bw) {
+                int yt = r.minY + bw;
+                int yb = r.maxY - 1 - bw;
+                if (yt < WORLD_HEIGHT) borderCellMap[yt * WORLD_WIDTH + x] = true;
+                if (yb >= 0)           borderCellMap[yb * WORLD_WIDTH + x] = true;
+            }
+        }
+    }
+}
+
+void Ped::Model::assignAgentsToRegions()
+{
+    for (auto &r : regions)
+        r.agentIds.clear();
+
+    for (int i = 0; i < agentData.count; ++i) {
+        int x = (int)roundf(agentData.x[i]);
+        int y = (int)roundf(agentData.y[i]);
+        bool placed = false;
+        for (auto &r : regions) {
+            if (x >= r.minX && x < r.maxX && y >= r.minY && y < r.maxY) {
+                r.agentIds.push_back(i);
+                placed = true;
+                break;
+            }
+        }
+        // Agent out of all regions (shouldn't happen, but be safe)
+        if (!placed && !regions.empty())
+            regions[0].agentIds.push_back(i);
+    }
+}
+
+void Ped::Model::tickREGION()
+{
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < agentData.count; ++i) {
+        float dx = agentData.destX[i] - agentData.x[i];
+        float dy = agentData.destY[i] - agentData.y[i];
+        float distSq = dx*dx + dy*dy;
+
+        if (distSq < agentData.destR[i]*agentData.destR[i] && agentData.wpCount[i] > 0) {
+            agentData.wpIndex[i] = (agentData.wpIndex[i]+1) % agentData.wpCount[i];
+            int pool = agentData.wpOffset[i] + agentData.wpIndex[i];
+            agentData.destX[i] = agentData.wpPoolX[pool];
+            agentData.destY[i] = agentData.wpPoolY[pool];
+            agentData.destR[i] = agentData.wpPoolR[pool];
+            dx = agentData.destX[i] - agentData.x[i];
+            dy = agentData.destY[i] - agentData.y[i];
+            distSq = dx*dx + dy*dy;
+        }
+        if (distSq > 1e-10f) {
+            float inv = 1.0f / sqrtf(distSq);
+            agentData.desiredX[i] = agentData.x[i] + dx * inv;
+            agentData.desiredY[i] = agentData.y[i] + dy * inv;
+        } else {
+            agentData.desiredX[i] = agentData.x[i];
+            agentData.desiredY[i] = agentData.y[i];
+        }
+    }
+
+    const int nRegions = (int)regions.size();
+
+#pragma omp parallel
+    {
+#pragma omp single nowait
+        {
+            for (int r = 0; r < nRegions; ++r) {
+#pragma omp task firstprivate(r)
+                {
+                    processRegion(r);
+                }
+            }
+        }
+    }  // implicit barrier — all tasks complete here
+
+    updateRegions();
+}
+
+void Ped::Model::processRegion(int regionIdx)
+{
+    Region &r = regions[regionIdx];
+    for (int agentId : r.agentIds)
+        moveInRegion(agentId, r);
+}
+
+// Region move
+void Ped::Model::moveInRegion(int id, const Region &region)
+{
+    int currentX = (int)roundf(agentData.x[id]);
+    int currentY = (int)roundf(agentData.y[id]);
+    int desiredX = (int)roundf(agentData.desiredX[id]);
+    int desiredY = (int)roundf(agentData.desiredY[id]);
+
+    if (currentX == desiredX && currentY == desiredY) return;
+
+    int diffX = desiredX - currentX;
+    int diffY = desiredY - currentY;
+
+    bool goingRight = (diffX > 0);
+    bool goingLeft  = (diffX < 0);
+    bool goingDown  = (diffY > 0);
+    bool goingUp    = (diffY < 0);
+
+    // Right-hand traffic lane preference (same heuristic as move())
+    int lanePreference = 0;
+    if      (goingRight) lanePreference = (currentY < 40) ? 0 : -10;
+    else if (goingLeft)  lanePreference = (currentY > 80) ? 0 : -10;
+    else if (goingDown)  lanePreference = (currentX < 80) ? 0 : -10;
+    else if (goingUp)    lanePreference = (currentX > 80) ? 0 : -10;
+    bool wrongLane = (lanePreference < 0);
+
+    bool directBlocked = false;
+    if (desiredX >= 0 && desiredX < WORLD_WIDTH && desiredY >= 0 && desiredY < WORLD_HEIGHT) {
+        directBlocked = (board[desiredY * WORLD_WIDTH + desiredX].load(std::memory_order_relaxed) != -1);
+    }
+
+    // Build candidate list (same priority logic as move())
+    std::pair<int,int> alts[20];
+    int altCount = 0;
+
+    auto addAlt = [&](int x, int y) {
+        for (int i = 0; i < altCount; ++i)
+            if (alts[i].first == x && alts[i].second == y) return;
+        if (altCount < 20) alts[altCount++] = {x, y};
+    };
+
+    auto addNormal = [&]() {
+        addAlt(desiredX, desiredY);
+        if (diffX == 0 || diffY == 0) {
+            addAlt(desiredX + diffY, desiredY + diffX);
+            addAlt(desiredX - diffY, desiredY - diffX);
+        } else {
+            addAlt(desiredX, currentY);
+            addAlt(currentX, desiredY);
+        }
+    };
+
+    auto addLane = [&]() {
+        if      (goingRight && currentY >= 40) { addAlt(currentX+1,currentY-1); addAlt(currentX,currentY-1); addAlt(currentX+1,currentY-2); }
+        else if (goingLeft  && currentY <= 80) { addAlt(currentX-1,currentY+1); addAlt(currentX,currentY+1); addAlt(currentX-1,currentY+2); }
+        else if (goingDown  && currentX >= 80) { addAlt(currentX-1,currentY+1); addAlt(currentX-1,currentY); addAlt(currentX-2,currentY+1); }
+        else if (goingUp    && currentX <= 80) { addAlt(currentX+1,currentY-1); addAlt(currentX+1,currentY); addAlt(currentX+2,currentY-1); }
+    };
+
+    if (/*wrongLane ||*/ directBlocked) { addLane(); addNormal(); }
+    else                             { addNormal(); addLane(); }
+
+    int adx = abs(diffX), ady = abs(diffY);
+    if      (diffX > 0 && adx >= ady) { addAlt(currentX+1,currentY); addAlt(currentX+1,currentY-1); addAlt(currentX,currentY-1); addAlt(currentX+1,currentY+1); addAlt(currentX,currentY+1); addAlt(currentX-1,currentY); addAlt(currentX-1,currentY-1); }
+    else if (diffX < 0 && adx >= ady) { addAlt(currentX-1,currentY); addAlt(currentX-1,currentY+1); addAlt(currentX,currentY+1); addAlt(currentX-1,currentY-1); addAlt(currentX,currentY-1); addAlt(currentX+1,currentY); addAlt(currentX+1,currentY+1); }
+    else if (diffY < 0 && ady > adx)  { addAlt(currentX,currentY-1); addAlt(currentX+1,currentY-1); addAlt(currentX+1,currentY); addAlt(currentX-1,currentY-1); addAlt(currentX-1,currentY); addAlt(currentX,currentY+1); addAlt(currentX+1,currentY+1); }
+    else if (diffY > 0 && ady > adx)  { addAlt(currentX,currentY+1); addAlt(currentX-1,currentY+1); addAlt(currentX-1,currentY); addAlt(currentX+1,currentY+1); addAlt(currentX+1,currentY); addAlt(currentX,currentY-1); addAlt(currentX-1,currentY-1); }
+    else { addAlt(currentX+1,currentY); addAlt(currentX+1,currentY+1); addAlt(currentX,currentY+1); addAlt(currentX-1,currentY+1); addAlt(currentX-1,currentY); addAlt(currentX-1,currentY-1); addAlt(currentX,currentY-1); addAlt(currentX+1,currentY-1); }
+
+    int oldIdx = currentY * WORLD_WIDTH + currentX;
+
+    for (int i = 0; i < altCount; ++i) {
+        int px = alts[i].first;
+        int py = alts[i].second;
+        if (px < 0 || px >= WORLD_WIDTH || py < 0 || py >= WORLD_HEIGHT) continue;
+
+        int targetIdx   = py * WORLD_WIDTH + px;
+        bool needAtomic = isBorderCell(px, py) || isBorderCell(currentX, currentY);
+
+        if (needAtomic) {
+            int expected = -1;
+            if (board[targetIdx].compare_exchange_strong(
+                    expected, id,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed))
+            {
+                // Release the old cell
+                if (oldIdx != targetIdx) {
+                    int me = id;
+                    board[oldIdx].compare_exchange_strong(
+                        me, -1,
+                        std::memory_order_release,
+                        std::memory_order_relaxed);
+                }
+                agentData.x[id] = (float)px;
+                agentData.y[id] = (float)py;
+                return;
+            }
+        } else {
+            // Use relaxed loads/stores (plain reads/writes on x86).
+            if (board[targetIdx].load(std::memory_order_relaxed) == -1) {
+                board[targetIdx].store(id,  std::memory_order_relaxed);
+                if (oldIdx != targetIdx)
+                    board[oldIdx].store(-1, std::memory_order_relaxed);
+                agentData.x[id] = (float)px;
+                agentData.y[id] = (float)py;
+                return;
+            }
+        }
+    }
+    // Agent could not move — stay in place (no starvation risk)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Dynamic region management
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── splitRegion ───────────────────────────────────────────────────────────────
+// Splits regions[idx] along its longer axis.  The two halves replace it.
+// Returns false if the region is too small to split.
+
+bool Ped::Model::splitRegion(int idx)
+{
+    // std::cout << "Splitting region " << idx << " with " << regions[idx].agentIds.size() << " agents\n";
+    Region &r = regions[idx];
+    int w = r.maxX - r.minX;
+    int h = r.maxY - r.minY;
+
+    if (w <= MIN_REGION_DIM * 2 && h <= MIN_REGION_DIM * 2) return false;
+    if ((int)regions.size() >= MAX_REGIONS)                   return false;
+
+    Region r1 = r, r2 = r;
+    if (w >= h) {
+        // Split horizontally (along X)
+        int mid  = r.minX + w / 2;
+        r1.maxX  = mid;
+        r2.minX  = mid;
+    } else {
+        // Split vertically (along Y)
+        int mid  = r.minY + h / 2;
+        r1.maxY  = mid;
+        r2.minY  = mid;
+    }
+    r1.agentIds.clear();
+    r2.agentIds.clear();
+
+    // Replace regions[idx] with r1, append r2
+    regions[idx] = r1;
+    regions.push_back(r2);
+    std::cout << "Split region " << idx << " into two regions with dimensions "
+              << "(" << r1.minX << "," << r1.minY << ")-(" << r1.maxX << "," << r1.maxY << ") and "
+              << "(" << r2.minX << "," << r2.minY << ")-(" << r2.maxX << "," << r2.maxY << ")\n";
+    return true;
+}
+
+// ── tryMergeRegions ───────────────────────────────────────────────────────────
+// Merges two axis-aligned adjacent regions into one (r1 absorbs r2).
+// They must share a complete edge.  Returns false if they are not adjacent.
+
+bool Ped::Model::tryMergeRegions(int r1Idx, int r2Idx)
+{
+    // std::cout << "Trying to merge regions " << r1Idx << " and " << r2Idx
+    //           << " with " << regions[r1Idx].agentIds.size() << " and "
+    //           << regions[r2Idx].agentIds.size() << " agents\n";
+    Region &r1 = regions[r1Idx];
+    Region &r2 = regions[r2Idx];
+
+    // Adjacent along X (r1 right of r2 or r2 right of r1)?
+    bool sameY = (r1.minY == r2.minY && r1.maxY == r2.maxY);
+    bool sameX = (r1.minX == r2.minX && r1.maxX == r2.maxX);
+
+    if (sameY && r1.maxX == r2.minX) { r1.maxX = r2.maxX; std::cout << "Merged regions " << r1Idx << " and " << r2Idx << std::endl; return true; }
+    if (sameY && r2.maxX == r1.minX) { r1.minX = r2.minX; std::cout << "Merged regions " << r1Idx << " and " << r2Idx << std::endl; return true; }
+    if (sameX && r1.maxY == r2.minY) { r1.maxY = r2.maxY; std::cout << "Merged regions " << r1Idx << " and " << r2Idx << std::endl; return true; }
+    if (sameX && r2.maxY == r1.minY) { r1.minY = r2.minY; std::cout << "Merged regions " << r1Idx << " and " << r2Idx << std::endl; return true; }
+
+    return false;
+}
+
+// ── updateRegions ─────────────────────────────────────────────────────────────
+// Called at the end of each REGION tick.
+//   1. Assign agents to (possibly changed) regions.
+//   2. Split overloaded regions.
+//   3. Merge underloaded adjacent region pairs.
+//   4. Rebuild the border map when the layout changed.
+
+void Ped::Model::updateRegions()
+{
+    // Always start with a fresh, accurate agent count per region.
+    assignAgentsToRegions();
+
+    bool changed = false;
+
+    // ── Split pass ────────────────────────────────────────────────────────────
+    // Iterate with index because splitRegion appends to the vector.
+    for (int i = 0; i < (int)regions.size(); ++i) {
+        if ((int)regions[i].agentIds.size() > SPLIT_THRESHOLD) {
+            if (splitRegion(i)) {
+                changed = true;
+            }
+        }
+    }
+
+    // ── Re-assign after splits ────────────────────────────────────────────────
+    // splitRegion clears agentIds on the two child regions.  Without this call
+    // the merge pass below sees those children as empty (0 agents) and
+    // immediately merges them back, causing the split-merge thrash visible in
+    // the output.
+    if (changed) {
+        assignAgentsToRegions();
+    }
+
+    // ── Merge pass ────────────────────────────────────────────────────────────
+    // Merge adjacent pairs that are both sparse AND whose combined population
+    // stays below SPLIT_THRESHOLD — otherwise the merged region would be split
+    // again on the very next tick.
+    bool merged = true;
+    while (merged && (int)regions.size() > 4) {  // never drop below 4 regions
+        merged = false;
+        for (int i = 0; i < (int)regions.size() && !merged; ++i) {
+            if ((int)regions[i].agentIds.size() > MERGE_THRESHOLD) continue;
+            for (int j = i + 1; j < (int)regions.size() && !merged; ++j) {
+                if ((int)regions[j].agentIds.size() > MERGE_THRESHOLD) continue; //TODO Add other logic with agents + agents < splitthreshold
+
+                // Guard: don't create a region that would immediately split again.
+                int combined = (int)(regions[i].agentIds.size() + regions[j].agentIds.size());
+                if (combined > SPLIT_THRESHOLD) continue;
+
+                if (tryMergeRegions(i, j)) {
+                    regions.erase(regions.begin() + j);
+                    changed = merged = true;
+                }
+            }
+        }
+    }
+
+    if (changed) {
+        assignAgentsToRegions();
+        rebuildBorderMap();
+    }
+}
+
 ////////////
 /// Everything below here relevant for Assignment 3.
 /// Don't use this for Assignment 1!
@@ -494,56 +903,175 @@ void Ped::Model::cleanupCUDA()
 
 // Moves the agent to the next desired position. If already taken, it will
 // be moved to a location close to it.
-void Ped::Model::move(Ped::Tagent *agent)
+void Ped::Model::move(int id)
 {
-    // Search for neighboring agents
-    std::set<const Ped::Tagent *> neighbors = getNeighbors(agent->getX(), agent->getY(), 2);
+    int currentX = (int)roundf(agentData.x[id]);
+    int currentY = (int)roundf(agentData.y[id]);
+    int desiredX = (int)roundf(agentData.desiredX[id]);
+    int desiredY = (int)roundf(agentData.desiredY[id]);
 
-    // Retrieve their positions
-    std::vector<std::pair<int, int>> takenPositions;
-    for (std::set<const Ped::Tagent *>::iterator neighborIt = neighbors.begin(); neighborIt != neighbors.end(); ++neighborIt)
-    {
-        std::pair<int, int> position((*neighborIt)->getX(), (*neighborIt)->getY());
-        takenPositions.push_back(position);
-    }
+    if (currentX == desiredX && currentY == desiredY) return;
 
-    // Compute the three alternative positions that would bring the agent
-    // closer to his desiredPosition, starting with the desiredPosition itself
-    std::vector<std::pair<int, int>> prioritizedAlternatives;
-    std::pair<int, int> pDesired(agent->getDesiredX(), agent->getDesiredY());
-    prioritizedAlternatives.push_back(pDesired);
+    int diffX = desiredX - currentX;
+    int diffY = desiredY - currentY;
 
-    int diffX = pDesired.first - agent->getX();
-    int diffY = pDesired.second - agent->getY();
-    std::pair<int, int> p1, p2;
-    if (diffX == 0 || diffY == 0)
-    {
-        // Agent wants to walk straight to North, South, West or East
-        p1 = std::make_pair(pDesired.first + diffY, pDesired.second + diffX);
-        p2 = std::make_pair(pDesired.first - diffY, pDesired.second - diffX);
-    }
-    else
-    {
-        // Agent wants to walk diagonally
-        p1 = std::make_pair(pDesired.first, agent->getY());
-        p2 = std::make_pair(agent->getX(), pDesired.second);
-    }
-    prioritizedAlternatives.push_back(p1);
-    prioritizedAlternatives.push_back(p2);
+    bool goingRight = (diffX > 0);
+    bool goingLeft  = (diffX < 0);
+    bool goingDown  = (diffY > 0);
+    bool goingUp    = (diffY < 0);
 
-    // Find the first empty alternative position
-    for (std::vector<std::pair<int, int>>::iterator it = prioritizedAlternatives.begin(); it != prioritizedAlternatives.end(); ++it)
-    {
-        // If the current position is not yet taken by any neighbor
-        if (std::find(takenPositions.begin(), takenPositions.end(), *it) == takenPositions.end())
-        {
-            // Set the agent's position
-            agent->setX((*it).first);
-            agent->setY((*it).second);
-            break;
+    int lanePreference = 0;
+    if      (goingRight) lanePreference = (currentY < 40) ? 0 : -10;
+    else if (goingLeft)  lanePreference = (currentY > 80) ? 0 : -10;
+    else if (goingDown)  lanePreference = (currentX < 80) ? 0 : -10;
+    else if (goingUp)    lanePreference = (currentX > 80) ? 0 : -10;
+    bool wrongLane = (lanePreference < 0);
+
+    bool directBlocked = false;
+    if (desiredX >= 0 && desiredX < WORLD_WIDTH && desiredY >= 0 && desiredY < WORLD_HEIGHT)
+        directBlocked = (board[desiredY * WORLD_WIDTH + desiredX].load(std::memory_order_relaxed) != -1);
+
+    std::pair<int,int> alts[20];
+    int altCount = 0;
+
+    auto addAlt = [&](int x, int y) {
+        for (int i = 0; i < altCount; ++i)
+            if (alts[i].first == x && alts[i].second == y) return;
+        if (altCount < 20) alts[altCount++] = {x, y};
+    };
+
+    auto addNormal = [&]() {
+        addAlt(desiredX, desiredY);
+        if (diffX == 0 || diffY == 0) { addAlt(desiredX+diffY, desiredY+diffX); addAlt(desiredX-diffY, desiredY-diffX); }
+        else                           { addAlt(desiredX, currentY); addAlt(currentX, desiredY); }
+    };
+    auto addLane = [&]() {
+        if      (goingRight && currentY >= 40) { addAlt(currentX+1,currentY-1); addAlt(currentX,currentY-1); addAlt(currentX+1,currentY-2); }
+        else if (goingLeft  && currentY <= 80) { addAlt(currentX-1,currentY+1); addAlt(currentX,currentY+1); addAlt(currentX-1,currentY+2); }
+        else if (goingDown  && currentX >= 80) { addAlt(currentX-1,currentY+1); addAlt(currentX-1,currentY); addAlt(currentX-2,currentY+1); }
+        else if (goingUp    && currentX <= 80) { addAlt(currentX+1,currentY-1); addAlt(currentX+1,currentY); addAlt(currentX+2,currentY-1); }
+    };
+
+    if (wrongLane || directBlocked) { addLane(); addNormal(); }
+    else                             { addNormal(); addLane(); }
+
+    int adx = abs(diffX), ady = abs(diffY);
+    if      (diffX > 0 && adx >= ady) { addAlt(currentX+1,currentY); addAlt(currentX+1,currentY-1); addAlt(currentX,currentY-1); addAlt(currentX+1,currentY+1); addAlt(currentX,currentY+1); addAlt(currentX-1,currentY); addAlt(currentX-1,currentY-1); }
+    else if (diffX < 0 && adx >= ady) { addAlt(currentX-1,currentY); addAlt(currentX-1,currentY+1); addAlt(currentX,currentY+1); addAlt(currentX-1,currentY-1); addAlt(currentX,currentY-1); addAlt(currentX+1,currentY); addAlt(currentX+1,currentY+1); }
+    else if (diffY < 0 && ady > adx)  { addAlt(currentX,currentY-1); addAlt(currentX+1,currentY-1); addAlt(currentX+1,currentY); addAlt(currentX-1,currentY-1); addAlt(currentX-1,currentY); addAlt(currentX,currentY+1); addAlt(currentX+1,currentY+1); }
+    else if (diffY > 0 && ady > adx)  { addAlt(currentX,currentY+1); addAlt(currentX-1,currentY+1); addAlt(currentX-1,currentY); addAlt(currentX+1,currentY+1); addAlt(currentX+1,currentY); addAlt(currentX,currentY-1); addAlt(currentX-1,currentY-1); }
+    else { addAlt(currentX+1,currentY); addAlt(currentX+1,currentY+1); addAlt(currentX,currentY+1); addAlt(currentX-1,currentY+1); addAlt(currentX-1,currentY); addAlt(currentX-1,currentY-1); addAlt(currentX,currentY-1); addAlt(currentX+1,currentY-1); }
+
+    for (int i = 0; i < altCount; ++i) {
+        int px = alts[i].first, py = alts[i].second;
+        if (px < 0 || px >= WORLD_WIDTH || py < 0 || py >= WORLD_HEIGHT) continue;
+
+        int targetIdx = py * WORLD_WIDTH + px;
+        int expected  = -1;
+        if (board[targetIdx].compare_exchange_strong(expected, id, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            int oldIdx = currentY * WORLD_WIDTH + currentX;
+            if (oldIdx != targetIdx) {
+                int me = id;
+                board[oldIdx].compare_exchange_strong(me, -1, std::memory_order_release, std::memory_order_relaxed);
+            }
+            agentData.x[id] = (float)px;
+            agentData.y[id] = (float)py;
+            return;
         }
     }
 }
+
+    
+// void Ped::Model::move(Ped::Tagent *agent)
+// {
+//     int id = agent->getId();
+//     // Search for neighboring agents
+//     std::set<const Ped::Tagent *> neighbors = getNeighbors((int)agentData.x[id], (int)agentData.y[id], 2);
+
+//     // Retrieve their positions
+//     std::vector<std::pair<int, int>> takenPositions;
+//     for (std::set<const Ped::Tagent *>::iterator neighborIt = neighbors.begin(); neighborIt != neighbors.end(); ++neighborIt)
+//     {
+//         if ((*neighborIt)->getId() != id)
+//         {
+//             std::pair<int, int> position((*neighborIt)->getX(), (*neighborIt)->getY());
+//             takenPositions.push_back(position);
+//         }
+        
+//     }
+
+//     // Compute the three alternative positions that would bring the agent
+//     // closer to his desiredPosition, starting with the desiredPosition itself
+//     std::vector<std::pair<int, int>> prioritizedAlternatives;
+//     std::pair<int, int> pDesired(agent->getDesiredX(), agent->getDesiredY());
+//     prioritizedAlternatives.push_back(pDesired);
+
+//     int diffX = pDesired.first - (int)agentData.x[id];
+//     int diffY = pDesired.second - (int)agentData.y[id];
+//     std::pair<int, int> p1, p2;
+//     if (diffX == 0 || diffY == 0)
+//     {
+//         // Agent wants to walk straight to North, South, West or East
+//         p1 = std::make_pair(pDesired.first + diffY, pDesired.second + diffX);
+//         p2 = std::make_pair(pDesired.first - diffY, pDesired.second - diffX);
+//     }
+//     else
+//     {
+//         // Agent wants to walk diagonally
+//         p1 = std::make_pair(pDesired.first, agentData.y[id]);
+//         p2 = std::make_pair(agentData.x[id], pDesired.second);
+//     }
+//     prioritizedAlternatives.push_back(p1);
+//     prioritizedAlternatives.push_back(p2);
+
+//     // Find the first empty alternative position
+//     for (std::vector<std::pair<int, int>>::iterator it = prioritizedAlternatives.begin(); it != prioritizedAlternatives.end(); ++it)
+//     {
+//         // If the current position is not yet taken by any neighbor
+//         if (std::find(takenPositions.begin(), takenPositions.end(), *it) == takenPositions.end())
+//         {
+//             // Set the agent's position
+//             agentData.x[id] = (float)(*it).first;
+//             agentData.y[id] = (float)(*it).second;
+
+//             // agent->setX((*it).first);
+//             // agent->setY((*it).second);j
+//             break;
+//         }
+//     }
+// }
+
+// void Ped::Model::buildRegions(int minX, int maxX, int minY, int maxY, const std::vector<int>& agentsInRect) 
+// {
+//     // Thresholds: Max 64 agents per region, minimum size 8x8
+//     if (agentsInRect.size() <= 64 || (maxX - minX) <= 8 || (maxY - minY) <= 8) {
+//         Region r = {minX, maxX, minY, maxY, agentsInRect};
+//         activeRegions.push_back(r);
+//         return;
+//     }
+    
+//     // Split into 4 quadrants
+//     int midX = minX + (maxX - minX) / 2;
+//     int midY = minY + (maxY - minY) / 2;
+    
+//     std::vector<int> topLeft, topRight, bottomLeft, bottomRight;
+    
+//     for (int id : agentsInRect) {
+//         int ax = (int)agentData.x[id];
+//         int ay = (int)agentData.y[id];
+        
+//         if (ax < midX && ay < midY) topLeft.push_back(id);
+//         else if (ax >= midX && ay < midY) topRight.push_back(id);
+//         else if (ax < midX && ay >= midY) bottomLeft.push_back(id);
+//         else bottomRight.push_back(id);
+//     }
+    
+//     // Recursively build children
+//     if (!topLeft.empty()) buildRegions(minX, midX, minY, midY, topLeft);
+//     if (!topRight.empty()) buildRegions(midX, maxX, minY, midY, topRight);
+//     if (!bottomLeft.empty()) buildRegions(minX, midX, midY, maxY, bottomLeft);
+//     if (!bottomRight.empty()) buildRegions(midX, maxX, midY, maxY, bottomRight);
+// }
 
 /// Returns the list of neighbors within dist of the point x/y. This
 /// can be the position of an agent, but it is not limited to this.
@@ -556,7 +1084,55 @@ std::set<const Ped::Tagent *> Ped::Model::getNeighbors(int x, int y, int dist) c
 {
     // create the output list
     // ( It would be better to include only the agents close by, but this programmer is lazy.)
-    return std::set<const Ped::Tagent *>(agents.begin(), agents.end());
+
+    std::set<const Ped::Tagent *> neighbors;
+    // float distSq = (float)(dist * dist);
+
+    for(int i = 0; i < agentData.count; i++)
+    {
+        int curr_positionX = agentData.x[i] - x;
+        int curr_positionY = agentData.y[i] - y;
+
+        if (abs(curr_positionX) <= dist && abs(curr_positionY) <= dist)
+        {
+            neighbors.insert(agents[i]);
+        }
+
+        // for(int j = 0; j < agentData.count; j++)
+        // {
+        //     if(i == j)
+        //     {
+        //         continue; //ingen anledning att jämföra agent pos med sig själv
+        //     }
+            
+        //     int positionX = agentData.x[j];
+        //     int positionY = agentData.y[j];
+
+            
+
+        //     float diff = sqrtf(abs(pow((curr_positionX - positionX), 2.0)) + abs(pow((curr_positionY - positionY), 2.0)));
+        //     // float diff = sqrtf(abs(curr_positionX - positionX) * (curr_positionY - positionY));
+        //     if(diff <= dist) 
+        //     {
+        //     // Lägg till i neighbors
+        //     // neighbors[i].insert(agents[j]);
+            
+        //     // neighbors.begin().insert(agents[j]);
+        //     *next(neighbors.begin(), i);
+
+            
+        //     }
+        // }
+
+    }
+    
+    return neighbors;
+    // return std::set<const Ped::Tagent *> (neighbors);
+    
+    // agentData.destR;
+    // agentData.destX;
+    // agentData.destY;
+    // return std::set<const Ped::Tagent *>(agents.begin(), agents.end());
 }
 
 void Ped::Model::cleanup()
@@ -623,6 +1199,22 @@ void Ped::Model::cleanup()
         _mm_free(agentData.wpPoolR);
         agentData.wpPoolR = nullptr;
     }
+    if (agentData.desiredX)
+    {
+        _mm_free(agentData.desiredX);
+        agentData.desiredX = nullptr;
+    }
+    if (agentData.desiredY)
+    {
+        _mm_free(agentData.desiredY);
+        agentData.desiredY = nullptr;
+    }
+
+    if (board != nullptr) {
+        delete[] board;
+        board = nullptr;
+    }
+    
 
     std::cout << "Freed all agentData arrays" << std::endl;
 

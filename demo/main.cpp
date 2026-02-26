@@ -75,6 +75,7 @@ int main(int argc, char*argv[]) {
             {"omp", no_argument, NULL, 'o'},
             {"pthread", no_argument, NULL, 'p'},
             {"seq", no_argument, NULL, 'q'},
+            {"reg", no_argument, NULL, 'r'},
             {0, 0, 0, 0}  // End of options
         };
 
@@ -133,6 +134,11 @@ int main(int argc, char*argv[]) {
                 // Handle --seq
                 std::cout << "Option --seq activated\n";
                 implementation_to_test = Ped::SEQ;
+                break;
+            case 'r':
+                // Handle --reg
+                std::cout << "Option --regions activated\n";
+                implementation_to_test = Ped::REGION;
                 break;
             case 'm':
                 // Handle --max-steps with a numerical argument

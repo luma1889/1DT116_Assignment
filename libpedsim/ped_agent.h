@@ -19,6 +19,7 @@
 #include <vector>
 #include <deque>
 #include <cmath>
+#include <set>
 
 namespace Ped {
     class Model;
@@ -44,8 +45,8 @@ namespace Ped {
         void setY(int newY);
         
         // For compatibility
-        int getDesiredX() const { return getX(); }
-        int getDesiredY() const { return getY(); }
+        int getDesiredX() const;
+        int getDesiredY() const;
         void computeNextDesiredPosition() {}  // Handled by Model
         
         // Waypoint management

@@ -56,6 +56,20 @@ void Ped::Tagent::setY(int newY) {
     }
 }
 
+int Ped::Tagent::getDesiredX() const {
+    if (model && id >= 0) {
+        return (int)roundf(model->agentData.desiredX[id]);
+    }
+    return init_x;
+}
+
+int Ped::Tagent::getDesiredY() const {
+    if (model && id >= 0) {
+        return (int)roundf(model->agentData.desiredY[id]);
+    }
+    return init_y;
+}
+
 void Ped::Tagent::addWaypoint(Twaypoint* wp) {
     tmp_waypoints.push_back(wp);
 }
