@@ -16,8 +16,8 @@ using namespace std;
 void Ped::Model::setupHeatmapSeq()
 {
 	int *hm = (int*)calloc(SIZE*SIZE, sizeof(int));
-	int *shm = (int*)malloc(SCALED_SIZE*SCALED_SIZE*sizeof(int));
-	int *bhm = (int*)malloc(SCALED_SIZE*SCALED_SIZE*sizeof(int));
+	int *shm = (int*)calloc(SCALED_SIZE*SCALED_SIZE, sizeof(int));
+	int *bhm = (int*)calloc(SCALED_SIZE*SCALED_SIZE, sizeof(int));
 
 	heatmap = (int**)malloc(SIZE*sizeof(int*));
 
@@ -112,7 +112,8 @@ void Ped::Model::updateHeatmapSeq()
 				}
 			}
 			int value = sum / WEIGHTSUM;
-			blurred_heatmap[i][j] = 0x00FF0000 | value << 24;
+			value = (value > 255) ? 255 : value;
+			blurred_heatmap[i][j] = (value << 24) | 0x00FF0000;
 		}
 	}
 }

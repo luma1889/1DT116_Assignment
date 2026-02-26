@@ -111,6 +111,8 @@ namespace Ped {
         void tickVECTOR();
         void tickCUDA();
         void tickREGION();
+
+        void computeDesiredPositions();
         
         // Setup helpers
         void allocateArrays();
@@ -189,6 +191,21 @@ namespace Ped {
         
         void setupCUDA();
         void cleanupCUDA();
+
+        struct HeatmapCUDAData {
+            int*   d_heatmap  = nullptr;   // SIZE x SIZE
+            int*   d_scaled   = nullptr;   // SCALED_SIZE x SCALED_SIZE
+            int*   d_blurred  = nullptr;   // SCALED_SIZE x SCALED_SIZE (result)
+            float* d_desiredX = nullptr;   // paddedCount
+            float* d_desiredY = nullptr;   // paddedCount
+            cudaStream_t stream = nullptr;
+        } heatmapData;
+
+        void setupHeatmapCUDA();    // called once from setup()
+        void launchHeatmapCUDA();   // async — issues all kernels, returns immediately
+        void syncHeatmapCUDA();     // sync stream, copy d_blurred → blurred_heatmap[0]
+        void cleanupHeatmapCUDA();
+        
         #endif
 
 #define SIZE 1024

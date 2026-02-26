@@ -24,6 +24,11 @@ extern "C" void cudaKernelfunction(float *d_x, float *d_y,
                                    int *d_wpIndex, const int *d_wpCount, const int *d_wpOffset,
                                    const float *d_wpPoolX, const float *d_wpPoolY, const float *d_wpPoolR,
                                    int numAgents, cudaStream_t stream);
+
+// Declared in ped_heatmap_cuda.cu
+extern "C" void launchHeatmapKernels(cudaStream_t, int*, int*, int*,
+                                      float*, float*,
+                                      const float*, const float*, int);
 #endif
 
 // Alignment for AVX2 (32 bytes)
@@ -73,16 +78,15 @@ void Ped::Model::setup(std::vector<Tagent *> agentsInScenario,
     if (implementation == REGION) {
         initRegions();
     }
+    setupHeatmapSeq();
 
     // CUDA-specific setup
-    if (implementation == CUDA)
-    {
-#ifdef USE_CUDA
-        setupCUDA();
+    #ifdef USE_CUDA
+        if (implementation == CUDA) {
+            setupCUDA();
+            setupHeatmapCUDA(); // Only setup CUDA heatmap if we are using CUDA!
+        }
 #endif
-    }
-
-    // setupHeatmapSeq();
 }
 
 void Ped::Model::allocateArrays()
@@ -189,30 +193,85 @@ void Ped::Model::initializeArrays()
     }
 }
 
+// Shared desired-position computation (used by tickREGION + tickOMP)
+void Ped::Model::computeDesiredPositions()
+{
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < agentData.count; ++i)
+    {
+        float dx = agentData.destX[i] - agentData.x[i];
+        float dy = agentData.destY[i] - agentData.y[i];
+        float distSq = dx * dx + dy * dy;
+        
+        // Update waypoint if reached
+        if (distSq < agentData.destR[i] * agentData.destR[i]) {
+            if (agentData.wpCount[i] > 0) {
+                int next = agentData.wpIndex[i] + 1;
+                if (next >= agentData.wpCount[i]) next = 0;
+                agentData.wpIndex[i] = next;
+                
+                int poolIdx = agentData.wpOffset[i] + next;
+                agentData.destX[i] = agentData.wpPoolX[poolIdx];
+                agentData.destY[i] = agentData.wpPoolY[poolIdx];
+                agentData.destR[i] = agentData.wpPoolR[poolIdx];
+                
+                // Recalculate dx/dy
+                dx = agentData.destX[i] - agentData.x[i];
+                dy = agentData.destY[i] - agentData.y[i];
+                distSq = dx * dx + dy * dy;
+            }
+        }
+        // Math Vector
+        if (distSq > 1e-10f) {
+            float invDist = 1.0f / sqrtf(distSq);
+            agentData.desiredX[i] = agentData.x[i] + dx * invDist;
+            agentData.desiredY[i] = agentData.y[i] + dy * invDist;
+        } else {
+            agentData.desiredX[i] = agentData.x[i];
+            agentData.desiredY[i] = agentData.y[i];
+        }
+    }
+}
+
 void Ped::Model::tick()
 {
-    switch (implementation)
-    {
-    case SEQ:
-        tickSEQ();
-        break;
-    case OMP:
-        tickOMP();
-        break;
-    case PTHREAD:
-        tickPTHREAD();
-        break;
-    case VECTOR:
-        tickVECTOR();
-        break;
-    case CUDA:
-        tickCUDA();
-        break;
-    case REGION:
-        tickREGION();
-        break;
+    if (implementation == REGION) {
+        tickREGION();   // handles heatmap internally for true overlap
+        return;
     }
-    // updateHeatmapSeq();
+
+    switch (implementation) {
+        case SEQ:    tickSEQ();    break;
+        case OMP:    tickOMP();    break;
+        case PTHREAD:tickPTHREAD();break;
+        case VECTOR: tickVECTOR(); break;
+        case CUDA:   tickCUDA();   break;
+        default: break;
+    }
+
+#ifdef USE_CUDA
+    if (implementation == CUDA) {
+        launchHeatmapCUDA();
+    }
+#endif
+
+if (implementation != CUDA && implementation != VECTOR) {
+        for (int i = 0; i < agentData.count; ++i) {
+            move(i);
+        }
+    } else if (implementation == CUDA) {
+        tickCUDA(); // tickCUDA handles the kernel launch for collisions
+    }
+
+    #ifdef USE_CUDA
+    if (implementation == CUDA) {
+        syncHeatmapCUDA();
+    } else {
+        updateHeatmapSeq();
+    }
+#else
+    updateHeatmapSeq();
+#endif
 }
 
 // Optimized sequential implementation
@@ -528,6 +587,64 @@ void Ped::Model::cleanupCUDA()
         cudaData.d_wpPoolR = nullptr;
     }
 }
+
+// Assignment 4 CUDA
+void Ped::Model::setupHeatmapCUDA()
+{
+    cudaStreamCreate(&heatmapData.stream);
+
+    // Device buffers
+    cudaMalloc(&heatmapData.d_heatmap,  (size_t)SIZE        * SIZE        * sizeof(int));
+    cudaMalloc(&heatmapData.d_scaled,   (size_t)SCALED_SIZE * SCALED_SIZE * sizeof(int));
+    cudaMalloc(&heatmapData.d_blurred,  (size_t)SCALED_SIZE * SCALED_SIZE * sizeof(int));
+    if (!heatmapData.d_heatmap || !heatmapData.d_scaled || !heatmapData.d_blurred) {
+        std::cerr << "FATAL: heatmap allocation failed (need ~200MB)\n";
+        exit(1);
+    }
+    cudaMalloc(&heatmapData.d_desiredX, (size_t)agentData.paddedCount * sizeof(float));
+    cudaMalloc(&heatmapData.d_desiredY, (size_t)agentData.paddedCount * sizeof(float));
+
+    // Initialise heatmap to zero (scaled/blurred will be fully overwritten each tick)
+    cudaMemset(heatmapData.d_heatmap, 0, (size_t)SIZE * SIZE * sizeof(int));
+    cudaDeviceSynchronize();
+}
+
+void Ped::Model::launchHeatmapCUDA()
+{
+    // Issues all kernels to heatmapData.stream and returns immediately.
+    // The caller can then do CPU work while the GPU processes the heatmap.
+    launchHeatmapKernels(
+        heatmapData.stream,
+        heatmapData.d_heatmap,
+        heatmapData.d_scaled,
+        heatmapData.d_blurred,
+        heatmapData.d_desiredX,
+        heatmapData.d_desiredY,
+        agentData.desiredX,          // host source (aligned float arrays)
+        agentData.desiredY,
+        agentData.count);
+}
+
+void Ped::Model::syncHeatmapCUDA()
+{
+    // Block until all heatmap kernels finish, then copy the blurred result
+    // back so the Qt render thread can display it via getHeatmap().
+    cudaStreamSynchronize(heatmapData.stream);
+    cudaMemcpy(blurred_heatmap[0],
+               heatmapData.d_blurred,
+               (size_t)SCALED_SIZE * SCALED_SIZE * sizeof(int),
+               cudaMemcpyDeviceToHost);
+}
+
+void Ped::Model::cleanupHeatmapCUDA()
+{
+    static bool done=false; if(done)return; done=true;
+#define HFREE(p) if(heatmapData.p){cudaFree(heatmapData.p);heatmapData.p=nullptr;}
+    HFREE(d_heatmap) HFREE(d_scaled) HFREE(d_blurred)
+    HFREE(d_desiredX) HFREE(d_desiredY)
+#undef HFREE
+    if(heatmapData.stream){cudaStreamDestroy(heatmapData.stream);heatmapData.stream=nullptr;}
+}
 #endif
 
 
@@ -629,6 +746,10 @@ void Ped::Model::tickREGION()
         }
     }
 
+    #ifdef USE_CUDA
+        launchHeatmapCUDA();
+    #endif
+
     const int nRegions = (int)regions.size();
 
 #pragma omp parallel
@@ -643,6 +764,12 @@ void Ped::Model::tickREGION()
             }
         }
     }  // implicit barrier — all tasks complete here
+
+    #ifdef USE_CUDA
+        syncHeatmapCUDA();
+    #else
+        updateHeatmapSeq();
+    #endif
 
     updateRegions();
 }
@@ -1144,6 +1271,7 @@ void Ped::Model::cleanup()
 #ifdef USE_CUDA
     if (implementation == CUDA)
         cleanupCUDA();
+    cleanupHeatmapCUDA();
     std::cout << "CUDA cleanup done" << std::endl;
 #endif
 }
