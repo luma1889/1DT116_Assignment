@@ -262,7 +262,7 @@ void Ped::Model::tickSEQ()
 }
 
 // Optimized OpenMP implementation
-void Ped::Model::tickOMP() 
+void Ped::Model::tickOMP()
 {
     // MATH (Calculate where agents want to go)
     #pragma omp parallel for schedule(static)
@@ -595,7 +595,7 @@ void Ped::Model::assignAgentsToRegions()
                 break;
             }
         }
-        // Agent out of all regions (shouldn't happen, but be safe)
+        // Agent outside of all regions
         if (!placed && !regions.empty())
             regions[0].agentIds.push_back(i);
     }
@@ -753,7 +753,6 @@ void Ped::Model::moveInRegion(int id, const Region &region)
                 return;
             }
         } else {
-            // Use relaxed loads/stores (plain reads/writes on x86).
             if (board[targetIdx].load(std::memory_order_relaxed) == -1) {
                 board[targetIdx].store(id,  std::memory_order_relaxed);
                 if (oldIdx != targetIdx)
@@ -767,11 +766,9 @@ void Ped::Model::moveInRegion(int id, const Region &region)
     // Agent could not move — stay in place (no starvation risk)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // Dynamic region management
-// ═══════════════════════════════════════════════════════════════════════════════
 
-// ── splitRegion ───────────────────────────────────────────────────────────────
+// Split regions
 // Splits regions[idx] along its longer axis.  The two halves replace it.
 // Returns false if the region is too small to split.
 
@@ -809,7 +806,7 @@ bool Ped::Model::splitRegion(int idx)
     return true;
 }
 
-// ── tryMergeRegions ───────────────────────────────────────────────────────────
+// Merge regions
 // Merges two axis-aligned adjacent regions into one (r1 absorbs r2).
 // They must share a complete edge.  Returns false if they are not adjacent.
 
@@ -833,7 +830,7 @@ bool Ped::Model::tryMergeRegions(int r1Idx, int r2Idx)
     return false;
 }
 
-// ── updateRegions ─────────────────────────────────────────────────────────────
+// Region update logic
 // Called at the end of each REGION tick.
 //   1. Assign agents to (possibly changed) regions.
 //   2. Split overloaded regions.
@@ -847,7 +844,6 @@ void Ped::Model::updateRegions()
 
     bool changed = false;
 
-    // ── Split pass ────────────────────────────────────────────────────────────
     // Iterate with index because splitRegion appends to the vector.
     for (int i = 0; i < (int)regions.size(); ++i) {
         if ((int)regions[i].agentIds.size() > SPLIT_THRESHOLD) {
@@ -857,19 +853,10 @@ void Ped::Model::updateRegions()
         }
     }
 
-    // ── Re-assign after splits ────────────────────────────────────────────────
-    // splitRegion clears agentIds on the two child regions.  Without this call
-    // the merge pass below sees those children as empty (0 agents) and
-    // immediately merges them back, causing the split-merge thrash visible in
-    // the output.
     if (changed) {
         assignAgentsToRegions();
     }
 
-    // ── Merge pass ────────────────────────────────────────────────────────────
-    // Merge adjacent pairs that are both sparse AND whose combined population
-    // stays below SPLIT_THRESHOLD — otherwise the merged region would be split
-    // again on the very next tick.
     bool merged = true;
     while (merged && (int)regions.size() > 4) {  // never drop below 4 regions
         merged = false;
@@ -1041,37 +1028,6 @@ void Ped::Model::move(int id)
 //     }
 // }
 
-// void Ped::Model::buildRegions(int minX, int maxX, int minY, int maxY, const std::vector<int>& agentsInRect) 
-// {
-//     // Thresholds: Max 64 agents per region, minimum size 8x8
-//     if (agentsInRect.size() <= 64 || (maxX - minX) <= 8 || (maxY - minY) <= 8) {
-//         Region r = {minX, maxX, minY, maxY, agentsInRect};
-//         activeRegions.push_back(r);
-//         return;
-//     }
-    
-//     // Split into 4 quadrants
-//     int midX = minX + (maxX - minX) / 2;
-//     int midY = minY + (maxY - minY) / 2;
-    
-//     std::vector<int> topLeft, topRight, bottomLeft, bottomRight;
-    
-//     for (int id : agentsInRect) {
-//         int ax = (int)agentData.x[id];
-//         int ay = (int)agentData.y[id];
-        
-//         if (ax < midX && ay < midY) topLeft.push_back(id);
-//         else if (ax >= midX && ay < midY) topRight.push_back(id);
-//         else if (ax < midX && ay >= midY) bottomLeft.push_back(id);
-//         else bottomRight.push_back(id);
-//     }
-    
-//     // Recursively build children
-//     if (!topLeft.empty()) buildRegions(minX, midX, minY, midY, topLeft);
-//     if (!topRight.empty()) buildRegions(midX, maxX, minY, midY, topRight);
-//     if (!bottomLeft.empty()) buildRegions(minX, midX, midY, maxY, bottomLeft);
-//     if (!bottomRight.empty()) buildRegions(midX, maxX, midY, maxY, bottomRight);
-// }
 
 /// Returns the list of neighbors within dist of the point x/y. This
 /// can be the position of an agent, but it is not limited to this.
@@ -1086,7 +1042,6 @@ std::set<const Ped::Tagent *> Ped::Model::getNeighbors(int x, int y, int dist) c
     // ( It would be better to include only the agents close by, but this programmer is lazy.)
 
     std::set<const Ped::Tagent *> neighbors;
-    // float distSq = (float)(dist * dist);
 
     for(int i = 0; i < agentData.count; i++)
     {
@@ -1098,41 +1053,9 @@ std::set<const Ped::Tagent *> Ped::Model::getNeighbors(int x, int y, int dist) c
             neighbors.insert(agents[i]);
         }
 
-        // for(int j = 0; j < agentData.count; j++)
-        // {
-        //     if(i == j)
-        //     {
-        //         continue; //ingen anledning att jämföra agent pos med sig själv
-        //     }
-            
-        //     int positionX = agentData.x[j];
-        //     int positionY = agentData.y[j];
-
-            
-
-        //     float diff = sqrtf(abs(pow((curr_positionX - positionX), 2.0)) + abs(pow((curr_positionY - positionY), 2.0)));
-        //     // float diff = sqrtf(abs(curr_positionX - positionX) * (curr_positionY - positionY));
-        //     if(diff <= dist) 
-        //     {
-        //     // Lägg till i neighbors
-        //     // neighbors[i].insert(agents[j]);
-            
-        //     // neighbors.begin().insert(agents[j]);
-        //     *next(neighbors.begin(), i);
-
-            
-        //     }
-        // }
-
     }
     
     return neighbors;
-    // return std::set<const Ped::Tagent *> (neighbors);
-    
-    // agentData.destR;
-    // agentData.destX;
-    // agentData.destY;
-    // return std::set<const Ped::Tagent *>(agents.begin(), agents.end());
 }
 
 void Ped::Model::cleanup()
