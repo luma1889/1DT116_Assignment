@@ -45,3 +45,6 @@ demo/demo
 /demo/config.mk
 /demo/Makefile
 /libpedsim/Makefile
+
+# Assignment plots
+*.png

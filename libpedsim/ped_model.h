@@ -99,7 +99,11 @@ namespace Ped {
 		std::vector<Twaypoint*> destinations;
 		bool globalIsCleaned;
 
+        double total_cpu_time = 0;
+        int cpu_frames = 0;
+
         std::vector<int> stuckCounter;  // Track how long each agent has been stuck
+        std::vector<int> agentRegionMap;  // Maps agent ID to its current region index (for REGION implementation)
 
         static constexpr int WORLD_WIDTH = 160;
         static constexpr int WORLD_HEIGHT = 120;
@@ -145,10 +149,10 @@ namespace Ped {
         // Region functions
         std::vector<Region> regions;
 
-        // Called once during setup: creates the initial 2×2 = 4 regions.
+        // Called once during setup: creates 4 strips as initial regions
         void initRegions();
 
-        // O(n) scan that places every agent into its owning region.
+        // Assign agents to regions based on their current positions
         void assignAgentsToRegions();
 
         // Process all agents inside one region.  Must be called from a single

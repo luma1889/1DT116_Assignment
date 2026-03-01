@@ -36,6 +36,11 @@ extern "C" void launchHeatmapKernels(cudaStream_t  stream,
     const float*  h_desiredX,
     const float*  h_desiredY,
     int           numAgents);
+
+extern "C" {
+    void calculateHeatmapTimings();
+    void printGPUHeatmapAverages();
+}
 #endif
 
 // Alignment for AVX2 (32 bytes)
@@ -247,7 +252,7 @@ void Ped::Model::tick()
         return;
     }
 
-    // 1. Calculate desired positions (Math) BEFORE launching the heatmap
+    // 1. Calculate desired positions (Math)
     if (implementation == SEQ) {
         // Sequential math
         for (int i = 0; i < agentData.count; ++i) {
@@ -280,90 +285,47 @@ void Ped::Model::tick()
         computeDesiredPositions();
     }
 
-    // 2. Launch GPU Heatmap asynchronously FOR ALL IMPLEMENTATIONS
+    // 2. Launch GPU Heatmap asynchronously (ONLY if NOT sequential)
 #ifdef USE_CUDA
-    auto start_gpu = std::chrono::high_resolution_clock::now();
-    launchHeatmapCUDA(); // Removed the if (implementation == CUDA) check!
+    if (implementation != SEQ) {
+        launchHeatmapCUDA();
+    }
 #endif
 
-    // 3. Move agents (Collision handling on CPU concurrently with GPU)
+    // 3. Move agents
     switch (implementation) {
-        case SEQ:
+        case SEQ:    
             for (int i = 0; i < agentData.count; ++i) move(i);
             break;
-
-        case OMP:
+        case OMP:    
         case PTHREAD:
-        case CUDA:
+        case CUDA: 
             #pragma omp parallel for schedule(dynamic, 64)
             for (int i = 0; i < agentData.count; ++i) move(i);
             break;
-
-        case VECTOR:
-            tickVECTOR();
+        case VECTOR: 
+            tickVECTOR(); 
             break;
-
         default: break;
     }
 
-    // 4. Synchronize GPU Heatmap before the frame is drawn
+    // 4. Synchronize GPU Heatmap OR run CPU Heatmap
 #ifdef USE_CUDA
-    syncHeatmapCUDA(); // Removed the if (implementation == CUDA) check!
-    auto end_gpu = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> gpu_time = end_gpu - start_gpu;
+    if (implementation != SEQ) {
+        syncHeatmapCUDA(); // GPU Sync
+    } else {
+        // SEQ MODE: Pure CPU Heatmap with built-in timing!
+        auto start_cpu = std::chrono::high_resolution_clock::now();
+        updateHeatmapSeq();
+        auto end_cpu = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> cpu_time = end_cpu - start_cpu;
+        
+        total_cpu_time += cpu_time.count();
+        cpu_frames++;
+    }
 #else
-    auto start_cpu = std::chrono::high_resolution_clock::now();
-    updateHeatmapSeq(); // Old sequential CPU heatmap
-    auto end_cpu = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> cpu_time = end_cpu - start_cpu;
-    std::cout << "Sequential CPU Heatmap took: " << cpu_time.count() << " ms" << std::endl;
+    updateHeatmapSeq();
 #endif
-}
-
-// Optimized sequential implementation
-void Ped::Model::tickSEQ()
-{
-    // Compute DESIRED positions and waypoints
-    for (int i = 0; i < agentData.count; ++i)
-    {
-        float dx = agentData.destX[i] - agentData.x[i];
-        float dy = agentData.destY[i] - agentData.y[i];
-        float distSq = dx * dx + dy * dy;
-        
-        // Update waypoint if reached
-        if (distSq < agentData.destR[i] * agentData.destR[i]) {
-            if (agentData.wpCount[i] > 0) {
-                int next = agentData.wpIndex[i] + 1;
-                if (next >= agentData.wpCount[i]) next = 0;
-                agentData.wpIndex[i] = next;
-                
-                int poolIdx = agentData.wpOffset[i] + next;
-                agentData.destX[i] = agentData.wpPoolX[poolIdx];
-                agentData.destY[i] = agentData.wpPoolY[poolIdx];
-                agentData.destR[i] = agentData.wpPoolR[poolIdx];
-                
-                // Recalculate dx/dy
-                dx = agentData.destX[i] - agentData.x[i];
-                dy = agentData.destY[i] - agentData.y[i];
-                distSq = dx * dx + dy * dy;
-            }
-        }
-        
-        // Math Vector
-        if (distSq > 1e-10f) {
-            float invDist = 1.0f / sqrtf(distSq);
-            agentData.desiredX[i] = agentData.x[i] + dx * invDist;
-            agentData.desiredY[i] = agentData.y[i] + dy * invDist;
-        } else {
-            agentData.desiredX[i] = agentData.x[i];
-            agentData.desiredY[i] = agentData.y[i];
-        }
-    }
-    
-    // Move
-    for (int i = 0; i < agentData.count; ++i) {
-        move(i);
-    }
 }
 
 // Optimized OpenMP implementation
@@ -673,11 +635,11 @@ void Ped::Model::launchHeatmapCUDA()
 
 void Ped::Model::syncHeatmapCUDA()
 {
-    // Block until all heatmap kernels finish, then copy the blurred result
-    // back so the Qt render thread can display it via getHeatmap().
     cudaStreamSynchronize(heatmapData.stream);
-    cudaMemcpy(blurred_heatmap[0],
-               heatmapData.d_blurred,
+    
+    calculateHeatmapTimings();
+
+    cudaMemcpy(blurred_heatmap[0], heatmapData.d_blurred,
                (size_t)SCALED_SIZE * SCALED_SIZE * sizeof(int),
                cudaMemcpyDeviceToHost);
 }
@@ -701,23 +663,24 @@ void Ped::Model::initRegions()
 {
     regions.clear();
 
-    // Start with a 2×2 grid → 4 regions
-    int midX = WORLD_WIDTH  / 2;   // 80
-    int midY = WORLD_HEIGHT / 2;   // 60
+    // Instead of a 2x2 grid, we make 4 wide horizontal stripes.
+    // Agents walking left/right will rarely cross these borders!
+    int sliceHeight = WORLD_HEIGHT / 4; 
 
-    regions.push_back({0,    midX, 0,    midY});   // top-left
-    regions.push_back({midX, WORLD_WIDTH,  0,    midY});   // top-right
-    regions.push_back({0,    midX, midY, WORLD_HEIGHT}); // bottom-left
-    regions.push_back({midX, WORLD_WIDTH,  midY, WORLD_HEIGHT}); // bottom-right
+    for (int i = 0; i < 4; ++i) {
+        Region r;
+        r.minX = 0;
+        r.maxX = WORLD_WIDTH;
+        r.minY = i * sliceHeight;
+        r.maxY = (i + 1) * sliceHeight;
+        regions.push_back(r);
+    }
 
     rebuildBorderMap();
     assignAgentsToRegions();
 }
 
 // Border map logic
-// Mark every cell that is within BORDER_WIDTH of any inter-region boundary.
-// Calls to this must happen after regions change.
-
 void Ped::Model::rebuildBorderMap()
 {
     std::fill(borderCellMap, borderCellMap + WORLD_WIDTH * WORLD_HEIGHT, false);
@@ -746,80 +709,104 @@ void Ped::Model::rebuildBorderMap()
 
 void Ped::Model::assignAgentsToRegions()
 {
-    for (auto &r : regions)
-        r.agentIds.clear();
+    // Ensure map is sized correctly
+    if (agentRegionMap.size() != (size_t)agentData.count) {
+        agentRegionMap.assign(agentData.count, -1);
+    }
 
+    // Clear agent lists in all regions
+    for (auto &r : regions) {
+        r.agentIds.clear();
+    }
+
+    // Process every agent
     for (int i = 0; i < agentData.count; ++i) {
         int x = (int)roundf(agentData.x[i]);
         int y = (int)roundf(agentData.y[i]);
         bool placed = false;
-        for (auto &r : regions) {
+        
+        int currentR = agentRegionMap[i];
+
+        // 1. FAST PATH: Check if agent is still in the same region (O(1))
+        if (currentR >= 0 && currentR < (int)regions.size()) {
+            const auto& r = regions[currentR];
             if (x >= r.minX && x < r.maxX && y >= r.minY && y < r.maxY) {
-                r.agentIds.push_back(i);
+                regions[currentR].agentIds.push_back(i);
                 placed = true;
-                break;
             }
         }
-        // Agent outside of all regions
-        if (!placed && !regions.empty())
+
+        // 2. SLOW PATH: Agent moved to a new region (O(Regions))
+        if (!placed) {
+            for (int rIdx = 0; rIdx < (int)regions.size(); ++rIdx) {
+                const auto& r = regions[rIdx];
+                if (x >= r.minX && x < r.maxX && y >= r.minY && y < r.maxY) {
+                    regions[rIdx].agentIds.push_back(i);
+                    agentRegionMap[i] = rIdx; 
+                    placed = true;
+                    break;
+                }
+            }
+        }
+
+        // 3. FALLBACK: Outside world bounds
+        if (!placed && !regions.empty()) {
             regions[0].agentIds.push_back(i);
+            agentRegionMap[i] = 0;
+        }
     }
 }
 
 void Ped::Model::tickREGION()
 {
-#pragma omp parallel for schedule(static)
-    for (int i = 0; i < agentData.count; ++i) {
-        float dx = agentData.destX[i] - agentData.x[i];
-        float dy = agentData.destY[i] - agentData.y[i];
-        float distSq = dx*dx + dy*dy;
+    auto start_time = std::chrono::high_resolution_clock::now();
 
-        if (distSq < agentData.destR[i]*agentData.destR[i] && agentData.wpCount[i] > 0) {
-            agentData.wpIndex[i] = (agentData.wpIndex[i]+1) % agentData.wpCount[i];
-            int pool = agentData.wpOffset[i] + agentData.wpIndex[i];
-            agentData.destX[i] = agentData.wpPoolX[pool];
-            agentData.destY[i] = agentData.wpPoolY[pool];
-            agentData.destR[i] = agentData.wpPoolR[pool];
-            dx = agentData.destX[i] - agentData.x[i];
-            dy = agentData.destY[i] - agentData.y[i];
-            distSq = dx*dx + dy*dy;
+    // 1. OVERLAPPING PIPELINE
+    // One thread does math, one thread does load balancing/assignment
+    #pragma omp parallel sections
+    {
+        #pragma omp section
+        {
+            computeDesiredPositions();
         }
-        if (distSq > 1e-10f) {
-            float inv = 1.0f / sqrtf(distSq);
-            agentData.desiredX[i] = agentData.x[i] + dx * inv;
-            agentData.desiredY[i] = agentData.y[i] + dy * inv;
-        } else {
-            agentData.desiredX[i] = agentData.x[i];
-            agentData.desiredY[i] = agentData.y[i];
+        #pragma omp section
+        {
+            updateRegions();
         }
     }
 
+    // 2. Launch GPU Heatmap asynchronously
     #ifdef USE_CUDA
         launchHeatmapCUDA();
     #endif
 
+    // 3. Move agents
     const int nRegions = (int)regions.size();
-
-#pragma omp parallel
+    #pragma omp parallel
     {
-#pragma omp single nowait
+        #pragma omp single nowait
         {
             for (int r = 0; r < nRegions; ++r) {
-#pragma omp task firstprivate(r)
+                #pragma omp task firstprivate(r)
                 {
                     processRegion(r);
                 }
             }
         }
-    }  // implicit barrier — all tasks complete here
+    } 
 
+    // 4. Sync Heatmap and Record GPU Timings
     #ifdef USE_CUDA
         syncHeatmapCUDA();
     #else
         updateHeatmapSeq();
     #endif
 
-    updateRegions();
+    // 5. Global Frame Timing
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> total_time = end_time - start_time;
+    total_cpu_time += total_time.count(); 
+    cpu_frames++;
 }
 
 void Ped::Model::processRegion(int regionIdx)
@@ -938,15 +925,12 @@ void Ped::Model::moveInRegion(int id, const Region &region)
             }
         }
     }
-    // Agent could not move — stay in place (no starvation risk)
+    // Agent could not move, stay in place
 }
 
 // Dynamic region management
 
 // Split regions
-// Splits regions[idx] along its longer axis.  The two halves replace it.
-// Returns false if the region is too small to split.
-
 bool Ped::Model::splitRegion(int idx)
 {
     // std::cout << "Splitting region " << idx << " with " << regions[idx].agentIds.size() << " agents\n";
@@ -975,16 +959,13 @@ bool Ped::Model::splitRegion(int idx)
     // Replace regions[idx] with r1, append r2
     regions[idx] = r1;
     regions.push_back(r2);
-    std::cout << "Split region " << idx << " into two regions with dimensions "
-              << "(" << r1.minX << "," << r1.minY << ")-(" << r1.maxX << "," << r1.maxY << ") and "
-              << "(" << r2.minX << "," << r2.minY << ")-(" << r2.maxX << "," << r2.maxY << ")\n";
+    // std::cout << "Split region " << idx << " into two regions with dimensions "
+    //           << "(" << r1.minX << "," << r1.minY << ")-(" << r1.maxX << "," << r1.maxY << ") and "
+    //           << "(" << r2.minX << "," << r2.minY << ")-(" << r2.maxX << "," << r2.maxY << ")\n";
     return true;
 }
 
 // Merge regions
-// Merges two axis-aligned adjacent regions into one (r1 absorbs r2).
-// They must share a complete edge.  Returns false if they are not adjacent.
-
 bool Ped::Model::tryMergeRegions(int r1Idx, int r2Idx)
 {
     // std::cout << "Trying to merge regions " << r1Idx << " and " << r2Idx
@@ -997,24 +978,17 @@ bool Ped::Model::tryMergeRegions(int r1Idx, int r2Idx)
     bool sameY = (r1.minY == r2.minY && r1.maxY == r2.maxY);
     bool sameX = (r1.minX == r2.minX && r1.maxX == r2.maxX);
 
-    if (sameY && r1.maxX == r2.minX) { r1.maxX = r2.maxX; std::cout << "Merged regions " << r1Idx << " and " << r2Idx << std::endl; return true; }
-    if (sameY && r2.maxX == r1.minX) { r1.minX = r2.minX; std::cout << "Merged regions " << r1Idx << " and " << r2Idx << std::endl; return true; }
-    if (sameX && r1.maxY == r2.minY) { r1.maxY = r2.maxY; std::cout << "Merged regions " << r1Idx << " and " << r2Idx << std::endl; return true; }
-    if (sameX && r2.maxY == r1.minY) { r1.minY = r2.minY; std::cout << "Merged regions " << r1Idx << " and " << r2Idx << std::endl; return true; }
+    // if (sameY && r1.maxX == r2.minX) { r1.maxX = r2.maxX; std::cout << "Merged regions " << r1Idx << " and " << r2Idx << std::endl; return true; }
+    // if (sameY && r2.maxX == r1.minX) { r1.minX = r2.minX; std::cout << "Merged regions " << r1Idx << " and " << r2Idx << std::endl; return true; }
+    // if (sameX && r1.maxY == r2.minY) { r1.maxY = r2.maxY; std::cout << "Merged regions " << r1Idx << " and " << r2Idx << std::endl; return true; }
+    // if (sameX && r2.maxY == r1.minY) { r1.minY = r2.minY; std::cout << "Merged regions " << r1Idx << " and " << r2Idx << std::endl; return true; }
 
     return false;
 }
 
-// Region update logic
-// Called at the end of each REGION tick.
-//   1. Assign agents to (possibly changed) regions.
-//   2. Split overloaded regions.
-//   3. Merge underloaded adjacent region pairs.
-//   4. Rebuild the border map when the layout changed.
-
+// Update regions
 void Ped::Model::updateRegions()
 {
-    // Always start with a fresh, accurate agent count per region.
     assignAgentsToRegions();
 
     bool changed = false;
@@ -1040,7 +1014,7 @@ void Ped::Model::updateRegions()
             for (int j = i + 1; j < (int)regions.size() && !merged; ++j) {
                 if ((int)regions[j].agentIds.size() > MERGE_THRESHOLD) continue; //TODO Add other logic with agents + agents < splitthreshold
 
-                // Guard: don't create a region that would immediately split again.
+                // don't create a region that would immediately split again.
                 int combined = (int)(regions[i].agentIds.size() + regions[j].agentIds.size());
                 if (combined > SPLIT_THRESHOLD) continue;
 
@@ -1213,21 +1187,24 @@ void Ped::Model::move(int id)
 /// \param   dist the distance around x/y that will be searched for agents (search field is a square in the current implementation)
 std::set<const Ped::Tagent *> Ped::Model::getNeighbors(int x, int y, int dist) const
 {
-    // create the output list
-    // ( It would be better to include only the agents close by, but this programmer is lazy.)
-
     std::set<const Ped::Tagent *> neighbors;
 
-    for(int i = 0; i < agentData.count; i++)
-    {
-        int curr_positionX = agentData.x[i] - x;
-        int curr_positionY = agentData.y[i] - y;
+    int minX = std::max(0, x - dist);
+    int maxX = std::min(WORLD_WIDTH - 1, x + dist);
+    int minY = std::max(0, y - dist);
+    int maxY = std::min(WORLD_HEIGHT - 1, y + dist);
 
-        if (abs(curr_positionX) <= dist && abs(curr_positionY) <= dist)
-        {
-            neighbors.insert(agents[i]);
+    // Only check the exact grid cells within the distance
+    for (int py = minY; py <= maxY; ++py) {
+        for (int px = minX; px <= maxX; ++px) {
+            // Read the atomic board
+            int id = board[py * WORLD_WIDTH + px].load(std::memory_order_relaxed);
+            
+            // If an agent is standing here, add them to the neighbor list
+            if (id != -1) {
+                neighbors.insert(agents[id]);
+            }
         }
-
     }
     
     return neighbors;
@@ -1235,11 +1212,22 @@ std::set<const Ped::Tagent *> Ped::Model::getNeighbors(int x, int y, int dist) c
 
 void Ped::Model::cleanup()
 {
-    static bool globalIsCleaned = false;
-    if (globalIsCleaned) return;
-    globalIsCleaned = true;
+    if (this->globalIsCleaned) return;
+    this->globalIsCleaned = true;
 
     std::cout << "Starting cleanup..." << std::endl;
+
+    // Print average CPU heatmap time
+    if (cpu_frames > 0) {
+        std::cout << "\n================ TIMING RESULTS ================\n";
+        std::cout << "Average PURE CPU Heatmap time: " << (total_cpu_time / cpu_frames) << " ms\n";
+        std::cout << "================================================\n\n";
+    }
+
+    // Print average GPU heatmap times
+    #ifdef USE_CUDA
+        printGPUHeatmapAverages();
+    #endif
 
     // Free aligned memory
     if (agentData.x)
