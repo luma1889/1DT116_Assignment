@@ -16,9 +16,9 @@
 #include <device_launch_parameters.h>
 
 // ── Compile-time constants (must match the values in ped_model.h) ─────────────
-#define HMAP_SIZE       1024
+#define HMAP_SIZE       160
 #define HMAP_CELLSIZE   5
-#define HMAP_SCALED     (HMAP_SIZE * HMAP_CELLSIZE)   // 5120
+#define HMAP_SCALED     (HMAP_SIZE * HMAP_CELLSIZE)   // 800
 
 // ── Blur kernel tile configuration ────────────────────────────────────────────
 #define BLUR_TILE       32
@@ -159,8 +159,6 @@ __global__ void blurKernel(const int* __restrict__ in,
         outY >= BLUR_RADIUS && outY < W - BLUR_RADIUS)
     {
         int sum = 0;
-        // smem[ty+dy][tx+dx] maps directly to the halo-loaded pixel
-        // at global position (outX + dx - RADIUS, outY + dy - RADIUS).
         #pragma unroll
         for (int dy = 0; dy < 5; dy++)
             #pragma unroll
@@ -168,8 +166,16 @@ __global__ void blurKernel(const int* __restrict__ in,
                 sum += gaussW[dy][dx] * smem[ty + dy][tx + dx];
 
         int val = sum / WEIGHTSUM;
-        // ARGB32: alpha = heat value, red channel always full, GB = 0
-        out[outY * W + outX] = 0x00FF0000 | (val << 24);
+        val = min(val, 255); // Prevent color overflow
+        
+        // Manually blend White to Red (No transparency needed!)
+        int gb = 255 - val;
+        out[outY * W + outX] = 0xFF000000 | (0xFF << 16) | (gb << 8) | gb;
+    } 
+    else if (outX < W && outY < W) 
+    {
+        // Force the border pixels to be solid White instead of transparent
+        out[outY * W + outX] = 0xFFFFFFFF;
     }
 }
 

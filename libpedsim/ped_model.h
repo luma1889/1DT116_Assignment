@@ -97,12 +97,21 @@ namespace Ped {
         IMPLEMENTATION implementation;
         std::vector<Tagent*> agents;
 		std::vector<Twaypoint*> destinations;
-		bool isCleaned;
+		bool globalIsCleaned;
 
         std::vector<int> stuckCounter;  // Track how long each agent has been stuck
 
         static constexpr int WORLD_WIDTH = 160;
         static constexpr int WORLD_HEIGHT = 120;
+
+        // The heatmap representing the density of agents
+		int ** heatmap = nullptr;
+
+		// The scaled heatmap that fits to the view
+		int ** scaled_heatmap = nullptr;
+
+		// The final heatmap: blurred and scaled to fit the view
+		int ** blurred_heatmap = nullptr;
         
         // Implementation methods
         void tickSEQ();
@@ -208,18 +217,9 @@ namespace Ped {
         
         #endif
 
-#define SIZE 1024
+#define SIZE 160
 #define CELLSIZE 5
 #define SCALED_SIZE SIZE*CELLSIZE
-
-		// The heatmap representing the density of agents
-		int ** heatmap;
-
-		// The scaled heatmap that fits to the view
-		int ** scaled_heatmap;
-
-		// The final heatmap: blurred and scaled to fit the view
-		int ** blurred_heatmap;
 
 		void setupHeatmapSeq();
 		void updateHeatmapSeq();

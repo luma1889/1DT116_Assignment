@@ -15,24 +15,24 @@ using namespace std;
 // Sets up the heatmap
 void Ped::Model::setupHeatmapSeq()
 {
-	int *hm = (int*)calloc(SIZE*SIZE, sizeof(int));
-	int *shm = (int*)calloc(SCALED_SIZE*SCALED_SIZE, sizeof(int));
-	int *bhm = (int*)calloc(SCALED_SIZE*SCALED_SIZE, sizeof(int));
+    int *hm  = (int*)calloc(SIZE * SIZE,               sizeof(int));
+    int *shm = (int*)calloc(SCALED_SIZE * SCALED_SIZE, sizeof(int));
 
-	heatmap = (int**)malloc(SIZE*sizeof(int*));
+    int *bhm = (int*)malloc(SCALED_SIZE * SCALED_SIZE * sizeof(int));
+    for (int i = 0; i < SCALED_SIZE * SCALED_SIZE; i++)
+        bhm[i] = 0x00000000;
 
-	scaled_heatmap = (int**)malloc(SCALED_SIZE*sizeof(int*));
-	blurred_heatmap = (int**)malloc(SCALED_SIZE*sizeof(int*));
+    heatmap         = (int**)malloc(SIZE        * sizeof(int*));
+    scaled_heatmap  = (int**)malloc(SCALED_SIZE * sizeof(int*));
+    blurred_heatmap = (int**)malloc(SCALED_SIZE * sizeof(int*));
 
-	for (int i = 0; i < SIZE; i++)
-	{
-		heatmap[i] = hm + SIZE*i;
-	}
-	for (int i = 0; i < SCALED_SIZE; i++)
-	{
-		scaled_heatmap[i] = shm + SCALED_SIZE*i;
-		blurred_heatmap[i] = bhm + SCALED_SIZE*i;
-	}
+    for (int i = 0; i < SIZE; i++)
+        heatmap[i] = hm + SIZE * i;
+
+    for (int i = 0; i < SCALED_SIZE; i++) {
+        scaled_heatmap[i]  = shm + SCALED_SIZE * i;
+        blurred_heatmap[i] = bhm + SCALED_SIZE * i;
+    }
 }
 
 // Updates the heatmap according to the agent positions
@@ -98,7 +98,7 @@ void Ped::Model::updateHeatmapSeq()
 	};
 
 #define WEIGHTSUM 273
-	// Apply gaussian blurfilter		       
+	// Apply gaussian blurfilter
 	for (int i = 2; i < SCALED_SIZE - 2; i++)
 	{
 		for (int j = 2; j < SCALED_SIZE - 2; j++)

@@ -48,6 +48,7 @@ MainWindow::MainWindow(const Ped::Model &pedModel) : model(pedModel)
 	const int heatmapSize = model.getHeatmapSize();
 	QPixmap pixmapDummy = QPixmap(heatmapSize, heatmapSize);
 	pixmap = scene->addPixmap(pixmapDummy);
+	pixmap->setZValue(-1);
 
 	paint();
 	graphicsView->show(); // Redundant? 
@@ -57,11 +58,14 @@ void MainWindow::paint() {
 
 	// Uncomment this to paint the heatmap (Assignment 4)
 	const int heatmapSize = model.getHeatmapSize();
+	// std::cerr << "DEBUG heatmapSize=" << heatmapSize << "\n";
 
 	int const * const * heatmapData = model.getHeatmap();
+	// std::cerr << "DEBUG heatmapData=" << (void*)heatmapData << "\n";
     if (heatmapData != nullptr && heatmapData[0] != nullptr) {
 	    QImage image((uchar*)heatmapData[0], heatmapSize, heatmapSize, heatmapSize * sizeof(int), QImage::Format_ARGB32);
 	    pixmap->setPixmap(QPixmap::fromImage(image));
+		// std::cout << "DEBUG: Heatmap updated in paint()\n";
     }
 
 	// QImage image((uchar*)*model.getHeatmap(), heatmapSize, heatmapSize, heatmapSize * sizeof(int), QImage::Format_ARGB32);

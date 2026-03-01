@@ -15,6 +15,7 @@
 #include <omp.h>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -26,9 +27,15 @@ extern "C" void cudaKernelfunction(float *d_x, float *d_y,
                                    int numAgents, cudaStream_t stream);
 
 // Declared in ped_heatmap_cuda.cu
-extern "C" void launchHeatmapKernels(cudaStream_t, int*, int*, int*,
-                                      float*, float*,
-                                      const float*, const float*, int);
+extern "C" void launchHeatmapKernels(cudaStream_t  stream,
+    int*          d_heatmap,
+    int*          d_scaled,
+    int*          d_blurred,
+    float*        d_desiredX,
+    float*        d_desiredY,
+    const float*  h_desiredX,
+    const float*  h_desiredY,
+    int           numAgents);
 #endif
 
 // Alignment for AVX2 (32 bytes)
@@ -48,7 +55,7 @@ void Ped::Model::setup(std::vector<Tagent *> agentsInScenario,
     this->implementation = implementation;
     this->agents = agentsInScenario;
     this->destinations = destinationsInScenario;
-    this->isCleaned = false;
+    this->globalIsCleaned = false;
 
     // Setup ID-based architecture
     for (int i = 0; i < (int)agents.size(); ++i)
@@ -84,8 +91,8 @@ void Ped::Model::setup(std::vector<Tagent *> agentsInScenario,
     #ifdef USE_CUDA
         if (implementation == CUDA) {
             setupCUDA();
-            setupHeatmapCUDA(); // Only setup CUDA heatmap if we are using CUDA!
         }
+        setupHeatmapCUDA();
 #endif
 }
 
@@ -236,41 +243,80 @@ void Ped::Model::computeDesiredPositions()
 void Ped::Model::tick()
 {
     if (implementation == REGION) {
-        tickREGION();   // handles heatmap internally for true overlap
+        tickREGION();   // handles heatmap internally
         return;
     }
 
+    // 1. Calculate desired positions (Math) BEFORE launching the heatmap
+    if (implementation == SEQ) {
+        // Sequential math
+        for (int i = 0; i < agentData.count; ++i) {
+            float dx = agentData.destX[i] - agentData.x[i];
+            float dy = agentData.destY[i] - agentData.y[i];
+            float distSq = dx * dx + dy * dy;
+            
+            if (distSq < agentData.destR[i] * agentData.destR[i] && agentData.wpCount[i] > 0) {
+                int next = (agentData.wpIndex[i] + 1) % agentData.wpCount[i];
+                agentData.wpIndex[i] = next;
+                int poolIdx = agentData.wpOffset[i] + next;
+                agentData.destX[i] = agentData.wpPoolX[poolIdx];
+                agentData.destY[i] = agentData.wpPoolY[poolIdx];
+                agentData.destR[i] = agentData.wpPoolR[poolIdx];
+                dx = agentData.destX[i] - agentData.x[i];
+                dy = agentData.destY[i] - agentData.y[i];
+                distSq = dx * dx + dy * dy;
+            }
+            if (distSq > 1e-10f) {
+                float invDist = 1.0f / sqrtf(distSq);
+                agentData.desiredX[i] = agentData.x[i] + dx * invDist;
+                agentData.desiredY[i] = agentData.y[i] + dy * invDist;
+            } else {
+                agentData.desiredX[i] = agentData.x[i];
+                agentData.desiredY[i] = agentData.y[i];
+            }
+        }
+    } else {
+        // Parallel math
+        computeDesiredPositions();
+    }
+
+    // 2. Launch GPU Heatmap asynchronously FOR ALL IMPLEMENTATIONS
+#ifdef USE_CUDA
+    auto start_gpu = std::chrono::high_resolution_clock::now();
+    launchHeatmapCUDA(); // Removed the if (implementation == CUDA) check!
+#endif
+
+    // 3. Move agents (Collision handling on CPU concurrently with GPU)
     switch (implementation) {
-        case SEQ:    tickSEQ();    break;
-        case OMP:    tickOMP();    break;
-        case PTHREAD:tickPTHREAD();break;
-        case VECTOR: tickVECTOR(); break;
-        case CUDA:   tickCUDA();   break;
+        case SEQ:
+            for (int i = 0; i < agentData.count; ++i) move(i);
+            break;
+
+        case OMP:
+        case PTHREAD:
+        case CUDA:
+            #pragma omp parallel for schedule(dynamic, 64)
+            for (int i = 0; i < agentData.count; ++i) move(i);
+            break;
+
+        case VECTOR:
+            tickVECTOR();
+            break;
+
         default: break;
     }
 
+    // 4. Synchronize GPU Heatmap before the frame is drawn
 #ifdef USE_CUDA
-    if (implementation == CUDA) {
-        launchHeatmapCUDA();
-    }
-#endif
-
-if (implementation != CUDA && implementation != VECTOR) {
-        for (int i = 0; i < agentData.count; ++i) {
-            move(i);
-        }
-    } else if (implementation == CUDA) {
-        tickCUDA(); // tickCUDA handles the kernel launch for collisions
-    }
-
-    #ifdef USE_CUDA
-    if (implementation == CUDA) {
-        syncHeatmapCUDA();
-    } else {
-        updateHeatmapSeq();
-    }
+    syncHeatmapCUDA(); // Removed the if (implementation == CUDA) check!
+    auto end_gpu = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> gpu_time = end_gpu - start_gpu;
 #else
-    updateHeatmapSeq();
+    auto start_cpu = std::chrono::high_resolution_clock::now();
+    updateHeatmapSeq(); // Old sequential CPU heatmap
+    auto end_cpu = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> cpu_time = end_cpu - start_cpu;
+    std::cout << "Sequential CPU Heatmap took: " << cpu_time.count() << " ms" << std::endl;
 #endif
 }
 
@@ -638,12 +684,14 @@ void Ped::Model::syncHeatmapCUDA()
 
 void Ped::Model::cleanupHeatmapCUDA()
 {
+    std::cout << "Cleaning up CUDA heatmap resources...\n";
     static bool done=false; if(done)return; done=true;
 #define HFREE(p) if(heatmapData.p){cudaFree(heatmapData.p);heatmapData.p=nullptr;}
     HFREE(d_heatmap) HFREE(d_scaled) HFREE(d_blurred)
     HFREE(d_desiredX) HFREE(d_desiredY)
 #undef HFREE
     if(heatmapData.stream){cudaStreamDestroy(heatmapData.stream);heatmapData.stream=nullptr;}
+    std::cout << "CUDA heatmap resources cleaned up.\n";
 }
 #endif
 
@@ -1066,7 +1114,7 @@ void Ped::Model::move(int id)
         else if (goingUp    && currentX <= 80) { addAlt(currentX+1,currentY-1); addAlt(currentX+1,currentY); addAlt(currentX+2,currentY-1); }
     };
 
-    if (wrongLane || directBlocked) { addLane(); addNormal(); }
+    if (/*wrongLane ||*/ directBlocked) { addLane(); addNormal(); }
     else                             { addNormal(); addLane(); }
 
     int adx = abs(diffX), ady = abs(diffY);
@@ -1187,9 +1235,9 @@ std::set<const Ped::Tagent *> Ped::Model::getNeighbors(int x, int y, int dist) c
 
 void Ped::Model::cleanup()
 {
-    if (isCleaned)
-        return;
-    isCleaned = true;
+    static bool globalIsCleaned = false;
+    if (globalIsCleaned) return;
+    globalIsCleaned = true;
 
     std::cout << "Starting cleanup..." << std::endl;
 
@@ -1269,8 +1317,9 @@ void Ped::Model::cleanup()
     std::cout << "Freed all agentData arrays" << std::endl;
 
 #ifdef USE_CUDA
-    if (implementation == CUDA)
+    if (implementation == CUDA) {
         cleanupCUDA();
+    }
     cleanupHeatmapCUDA();
     std::cout << "CUDA cleanup done" << std::endl;
 #endif
